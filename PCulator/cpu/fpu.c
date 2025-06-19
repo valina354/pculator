@@ -1,1918 +1,1376 @@
-/*
-  PCulator: A portable, open-source x86 PC emulator.
-  Copyright (C)2025 Mike Chambers
+﻿#include "fpu.h"
 
-  This program is free software; you can redistribute it and/or
-  modify it under the terms of the GNU General Public License
-  as published by the Free Software Foundation; either version 2
-  of the License, or (at your option) any later version.
-
-  This program is distributed in the hope that it will be useful,
-  but WITHOUT ANY WARRANTY; without even the implied warranty of
-  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-  GNU General Public License for more details.
-
-  You should have received a copy of the GNU General Public License
-  along with this program; if not, write to the Free Software
-  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
-*/
-
-// This FPU was taken from Halfix and adapted hastily. I think I broke it.
-
-#include <stdio.h>
-#include <stdint.h>
-#include <stddef.h>
-#include <string.h>
 #include <math.h>
-#include <fenv.h>
-#include "cpu.h"
-//#include "fpu.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
 #include "../memory.h"
-#include "../config.h"
-#include "../debuglog.h"
 
-#define UNUSED(x)
+/*#include "blink/builtin.h"
+#include "blink/case.h"
+#include "blink/endian.h"
+#include "blink/flags.h"
+#include "blink/ldbl.h"
+#include "blink/machine.h"
+#include "blink/macros.h"
+#include "blink/modrm.h"
+#include "blink/pun.h"
+#include "blink/rde.h"*/
 
-//#define XCHOP
+#define __builtin_unreachable() {}
 
-#define EXCEPTION_HANDLER return 1
+#define FPUREG 0
+#define MEMORY 1
 
-#define FLOATX80
-#include "softfloat/softfloat.h"
-#include "softfloat/softfloatx80.h"
+#define DISP(x, y, z) ((7 & (x)) << 4 | (y) << 3 | (u32)(z))
 
-#define NEED_STRUCT
-#include "fpu.h"
-#undef NEED_STRUCT
+#define P                struct Machine *m, u64 rde, i64 disp, u64 uimm0
+#define A                m, rde, disp, uimm0
+#define DISPATCH_NOTHING m, 0, 0, 0
 
-CPU_t* cpu;
+#define CASE(OP, CODE) \
+  case OP:             \
+    CODE;              \
+    break
 
-#if 0
-// For savestate generator
+#define CASR(OP, CODE) \
+  case OP:             \
+    CODE;              \
+    return
 
-    // <<< BEGIN STRUCT "struct" >>>
-int ftop;
-uint16_t control_word, status_word, tag_word;
-uint32_t fpu_eip, fpu_data_ptr;
-uint16_t fpu_cs, fpu_opcode, fpu_data_seg;
-// <<< END STRUCT "struct" >>>
+#define XLAT(x, y) \
+  case x:          \
+    return y
+
+#define ModrmRm(x) m->cpu->rm
+#define ModrmReg(x) m->cpu->reg
+#define ModrmMode(x) m->cpu->mode
+
+#ifdef MIN
+#undef MIN
 #endif
 
-enum {
-    FPU_TAG_VALID = 0,
-    FPU_TAG_ZERO = 1,
-    FPU_TAG_SPECIAL = 2,
-    FPU_TAG_EMPTY = 3
-};
-
-#define FPU_ROUND_SHIFT 10
-#define FPU_PRECISION_SHIFT 8
-enum {
-    FPU_ROUND_NEAREST = 0,
-    FPU_ROUND_DOWN = 1,
-    FPU_ROUND_UP = 2,
-    FPU_ROUND_TRUNCATE = 3
-};
-enum {
-    FPU_PRECISION_24 = 0, // 32-bit float
-    FPU_PRECISION_53 = 2, // 64-bit double
-    FPU_PRECISION_64 = 3 // 80-bit st80
-};
-#define FPU_EXCEPTION_STACK_FAULT (1 << 6)
-#define FPU_EXCEPTION_PRECISION (1 << 5)
-#define FPU_EXCEPTION_UNDERFLOW (1 << 4)
-#define FPU_EXCEPTION_OVERFLOW (1 << 3)
-#define FPU_EXCEPTION_ZERO_DIVIDE (1 << 2)
-#define FPU_EXCEPTION_DENORMALIZED (1 << 1)
-#define FPU_EXCEPTION_INVALID_OPERATION (1 << 0)
-
-// Status word
-#define GET_C0 (fpu.status_word & (1 << 8)) != 0
-#define GET_C1 (fpu.status_word & (1 << 9)) != 0
-#define GET_C2 (fpu.status_word & (1 << 10)) != 0
-#define GET_C3 (fpu.status_word & (1 << 14)) != 0
-#define FPU_FTOP_SHIFT 11
-
-#define SET_C0(n) fpu.status_word = (fpu.status_word & ~(1 << 8)) | (n) << 8
-#define SET_C1(n) fpu.status_word = (fpu.status_word & ~(1 << 9)) | (n) << 9
-#define SET_C2(n) fpu.status_word = (fpu.status_word & ~(1 << 10)) | (n) << 10
-#define SET_C3(n) fpu.status_word = (fpu.status_word & ~(1 << 14)) | (n) << 14
-
-#define MASKED(a) (fpu.control_word & a)
-
-static const floatx80 Zero = BUILD_FLOAT(0, 0);
-static const floatx80 IndefiniteNaN = BUILD_FLOAT(0xFFFF, 0xC000000000000000);
-//static const floatx80 PositiveInfinity = BUILD_FLOAT(0x7FFF, 0x8000000000000000);
-//static const extFloat80_t NegativeInfinity = BUILD_FLOAT(0xFFFF, 0x8000000000000000);
-static const floatx80 Constant_1 = BUILD_FLOAT(0x3fff, 0x8000000000000000);
-static const floatx80 Constant_L2T = BUILD_FLOAT(0x4000, 0xd49a784bcd1b8afe);
-static const floatx80 Constant_L2E = BUILD_FLOAT(0x3fff, 0xb8aa3b295c17f0bc);
-static const floatx80 Constant_PI = BUILD_FLOAT(0x4000, 0xc90fdaa22168c235);
-static const floatx80 Constant_LG2 = BUILD_FLOAT(0x3ffd, 0x9a209a84fbcff799);
-static const floatx80 Constant_LN2 = BUILD_FLOAT(0x3ffe, 0xb17217f7d1cf79ac);
-
-static const floatx80* Constants[8] = {
-    // Technically, there are only 7 constants according to the x87 spec, but to make this array nice and round, I'm going to assume that were there to be an eighth value, it would be an indefinite NaN.
-    &Constant_1, &Constant_L2T, &Constant_L2E, &Constant_PI, &Constant_LG2, &Constant_LN2, &Zero, &IndefiniteNaN
-};
-
-struct fpu fpu;
-
-void cpu_set_cf(int val) {
-    cpu->cf = val ? 1 : 0;
-}
-
-void cpu_set_pf(int val) {
-    cpu->pf = val ? 1 : 0;
-}
-
-void cpu_set_zf(int val) {
-    cpu->zf = val ? 1 : 0;
-}
-
-int cpu_get_cf() {
-    return cpu->cf;
-}
-
-int cpu_get_pf() {
-    return cpu->pf;
-}
-
-int cpu_get_zf() {
-    return cpu->zf;
-}
-
-// FLDCW
-static void fpu_set_control_word(uint16_t control_word)
-{
-    control_word |= 0x40; // Experiments with real hardware indicate that bit 6 is always set.
-    fpu.control_word = control_word;
-
-    int rounding = fpu.control_word >> FPU_ROUND_SHIFT & 3;
-    switch (rounding) {
-    case FPU_ROUND_NEAREST: // aka round to even
-        fpu.status.float_rounding_mode = float_round_nearest_even;
-        break;
-    case FPU_ROUND_DOWN:
-        fpu.status.float_rounding_mode = float_round_down;
-        break;
-    case FPU_ROUND_UP:
-        fpu.status.float_rounding_mode = float_round_up;
-        break;
-    case FPU_ROUND_TRUNCATE: // aka towards zero
-        fpu.status.float_rounding_mode = float_round_to_zero;
-        break;
-    }
-    int precision = fpu.control_word >> FPU_PRECISION_SHIFT & 3;
-    switch (precision) {
-    case FPU_PRECISION_24: // aka float
-        fpu.status.float_rounding_precision = 32;
-        break;
-    case FPU_PRECISION_53: // aka double
-        fpu.status.float_rounding_precision = 64;
-        break;
-    case FPU_PRECISION_64: // This is the default
-        fpu.status.float_rounding_precision = 80;
-        break;
-    }
-
-    // Are these right?
-    fpu.status.float_exception_flags = 0; // clear exceptions before execution
-    fpu.status.float_nan_handling_mode = float_first_operand_nan;
-    fpu.status.flush_underflow_to_zero = 0;
-    fpu.status.float_suppress_exception = 0;
-    fpu.status.float_exception_masks = control_word & 0x3F;
-    fpu.status.denormals_are_zeros = 0;
-}
-
-static void fpu_state(void)
-{
-    //TODO: Something
-/*#ifndef LIBCPU
-    // <<< BEGIN AUTOGENERATE "state" >>>
-    struct bjson_object* obj = state_obj("fpu", 9 + 16);
-    state_field(obj, 4, "fpu.ftop", &fpu.ftop);
-    state_field(obj, 2, "fpu.control_word", &fpu.control_word);
-    state_field(obj, 2, "fpu.status_word", &fpu.status_word);
-    state_field(obj, 2, "fpu.tag_word", &fpu.tag_word);
-    state_field(obj, 4, "fpu.fpu_eip", &fpu.fpu_eip);
-    state_field(obj, 4, "fpu.fpu_data_ptr", &fpu.fpu_data_ptr);
-    state_field(obj, 2, "fpu.fpu_cs", &fpu.fpu_cs);
-    state_field(obj, 2, "fpu.fpu_opcode", &fpu.fpu_opcode);
-    state_field(obj, 2, "fpu.fpu_data_seg", &fpu.fpu_data_seg);
-    // <<< END AUTOGENERATE "state" >>>
-    char name[32];
-    for (int i = 0; i < 8; i++) {
-        sprintf(name, "fpu.st[%d].mantissa", i);
-        state_field(obj, 8, name, &fpu.st[i].fraction);
-        sprintf(name, "fpu.st[%d].exponent", i);
-        state_field(obj, 2, name, &fpu.st[i].exp);
-    }
-    if (state_is_reading())
-        fpu_set_control_word(fpu.control_word);
-#endif*/
-}
-
-static uint16_t fpu_get_status_word(void)
-{
-    return fpu.status_word | (fpu.ftop << 11);
-}
-
-// Helper functions to determine type of floating point number.
-static int is_denormal(uint16_t exponent, uint64_t mantissa)
-{
-    return !(exponent & 0x7FFF) && mantissa;
-}
-static int is_pseudo_denormal(uint16_t exponent, uint64_t mantissa)
-{
-    return is_denormal(exponent, mantissa) && !(mantissa & 0x8000000000000000ULL);
-}
-
-static int is_zero(uint16_t exponent, uint64_t mantissa)
-{
-    return ((exponent & 0x7FFF) | mantissa) == 0;
-}
-
-// Check if a floating point number is a zero of any sign.
-// Returns 1 if it's a positive zero
-// Returns -1 if it's a negative zero
-// Returns 0 if it's neither.
-static int is_zero_any_sign(uint16_t exponent, uint64_t mantissa)
-{
-    if (is_zero(exponent, mantissa)) {
-        if (exponent & 0x8000)
-            return -1;
-        else
-            return 1;
-    }
-    else
-        return 0;
-}
-
-int is_negative(uint16_t exponent, uint64_t mantissa)
-{
-    return !is_zero_any_sign(exponent, mantissa) && (exponent & 0x8000) != 0;
-}
-
-static int is_invalid(uint16_t exponent, uint64_t mantissa)
-{
-    // Check for pseudo NaN, pseudo Infinity, or Unnormal
-    uint16_t exponent_without_sign = exponent & 0x7FFF;
-    if (exponent_without_sign != 0)
-        return (mantissa & 0x8000000000000000ULL) == 0; // Pseudo-NaN, Pseudo-Infinity, or Unnormal
-    return 0;
-}
-
-// Returns:
-//   -1 for -Infinity
-//    1 for Infinity
-//    0 for non-infinity
-static int is_infinity(uint16_t exponent, uint64_t mantissa)
-{
-    if (((exponent & 0x7FFF) == 0x7FFF) && (mantissa == 0x8000000000000000ULL))
-        return mantissa >> 15 ? -1 : 1;
-    return 0;
-}
-
-// Returns 1 if quiet, 2 if signalling, 0 if neither
-static int is_nan(uint16_t exponent, uint64_t mantissa)
-{
-    if (((exponent & 0x7FFF) == 0x7FFF) && (mantissa != 0x8000000000000000ULL))
-        return 1 + ((mantissa & 0x4000000000000000ULL) != 0);
-    return 0;
-}
-
-static int fpu_get_tag_from_value(floatx80* f)
-{
-    uint16_t exponent;
-    uint64_t mantissa;
-    floatx80_unpack(f, exponent, mantissa);
-    if ((exponent | mantissa) == 0) // Both exponent and mantissa are zero
-        return FPU_TAG_ZERO;
-
-    int x = 0;
-    x |= is_infinity(exponent, mantissa);
-    x |= is_denormal(exponent, mantissa);
-    x |= is_pseudo_denormal(exponent, mantissa);
-    x |= is_invalid(exponent, mantissa);
-    x |= is_nan(exponent, mantissa);
-
-    if (x)
-        return FPU_TAG_SPECIAL;
-    return FPU_TAG_VALID;
-}
-
-static int fpu_get_tag(int st)
-{
-    return fpu.tag_word >> (((st + fpu.ftop) & 7) << 1) & 3;
-}
-static void fpu_set_tag(int st, int v)
-{
-    int shift = ((st + fpu.ftop) & 7) << 1;
-    fpu.tag_word &= ~(3 << shift);
-    fpu.tag_word |= v << shift;
-}
-
-static int fpu_exception_raised(int flags)
-{
-    return (fpu.status.float_exception_flags & ~fpu.status.float_exception_masks) & flags;
-}
-
-// Note that stack faults must be handled before any arith, softfloat.c may clear them.
-static void fpu_stack_fault(void)
-{
-    //__asm__("int3");
-    fpu.status.float_exception_flags = FPU_EXCEPTION_INVALID_OPERATION | FPU_EXCEPTION_STACK_FAULT;
-    //if(fpu.status.float_exception_masks & FPU_EXCEPTION_INVALID_OPERATION) return 1;
-    //return 0;
-}
-
-static uint32_t partial_sw, bits_to_clear;
-
-static void fpu_commit_sw(void)
-{
-    // XXX this is a really, really bad kludge
-    fpu.status_word |= partial_sw;
-    fpu.status_word &= ~bits_to_clear | partial_sw;
-    bits_to_clear = 0;
-    partial_sw = 0;
-}
-
-static int fpu_check_exceptions2(int commit_sw)
-{
-    int flags = fpu.status.float_exception_flags;
-    int unmasked_exceptions = (flags & ~fpu.status.float_exception_masks) & 0x3F;
-
-    // Note: #P is ignored if #U or #O is set.
-    if (flags & FPU_EXCEPTION_PRECISION && (flags & (FPU_EXCEPTION_UNDERFLOW | FPU_EXCEPTION_OVERFLOW))) {
-        flags &= ~FPU_EXCEPTION_PRECISION;
-        unmasked_exceptions &= ~FPU_EXCEPTION_PRECISION;
-    }
-
-    // Note: C1 is set if the result was rounded up, but cleared if a stack underflow occurred
-    if (flags & 0x10000) {
-        // Stack underflow occurred
-        flags &= ~(1 << 9);
-    }
-
-    // If #I, #D, or #Z, then ignore others.
-    if (flags & (FPU_EXCEPTION_INVALID_OPERATION | FPU_EXCEPTION_ZERO_DIVIDE | FPU_EXCEPTION_DENORMALIZED)) {
-        unmasked_exceptions &= FPU_EXCEPTION_INVALID_OPERATION | FPU_EXCEPTION_ZERO_DIVIDE | FPU_EXCEPTION_DENORMALIZED;
-        flags &= FPU_EXCEPTION_INVALID_OPERATION | FPU_EXCEPTION_ZERO_DIVIDE | FPU_EXCEPTION_DENORMALIZED | FPU_EXCEPTION_STACK_FAULT;
-    }
-
-    if (commit_sw)
-        fpu.status_word |= flags;
-    else
-        partial_sw |= flags;
-
-    if (unmasked_exceptions) {
-        fpu.status_word |= 0x8080;
-        if (unmasked_exceptions & ~FPU_EXCEPTION_PRECISION)
-            return 1;
-        return 0; // Only #P is raised but we can ignore that
-    }
-
-    return 0;
-}
-
-static int fpu_check_exceptions(void)
-{
-    return fpu_check_exceptions2(1);
-}
-
-static void fninit(void)
-{
-    // https://www.felixcloutier.com/x86/finit:fninit
-    fpu_set_control_word(0x37F);
-    fpu.status_word = 0;
-    fpu.tag_word = 0xFFFF;
-    fpu.ftop = 0;
-    fpu.fpu_data_ptr = 0;
-    fpu.fpu_data_seg = 0;
-    fpu.fpu_eip = 0;
-    fpu.fpu_cs = 0; // Not in the docs, but assuming that it's the case
-    fpu.fpu_opcode = 0;
-}
-
-static inline int fpu_nm_check(void)
-{
-    //if (cpu.cr[0] & (CR0_EM | CR0_TS))
-    //    EXCEPTION_NM();
-    return 0;
-}
-
-static inline floatx80* fpu_get_st_ptr(int st)
-{
-    return &fpu.st[(fpu.ftop + st) & 7];
-}
-static inline floatx80 fpu_get_st(int st)
-{
-    return fpu.st[(fpu.ftop + st) & 7];
-}
-static inline void fpu_set_st(int st, floatx80 data)
-{
-    fpu_set_tag(st, fpu_get_tag_from_value(&data));
-    fpu.st[(fpu.ftop + st) & 7] = data;
-}
-
-// Fault if ST register is not empty.
-static int fpu_check_stack_overflow(int st)
-{
-    int tag = fpu_get_tag(st);
-    if (tag != FPU_TAG_EMPTY) {
-        SET_C1(1);
-        fpu_stack_fault();
-        return 1;
-    }
-    SET_C1(0);
-    return 0;
-}
-
-// Fault if ST register is empty.
-static int fpu_check_stack_underflow(int st, int commit_sw)
-{
-    int tag = fpu_get_tag(st);
-    if (tag == FPU_TAG_EMPTY) {
-        fpu_stack_fault();
-        if (commit_sw)
-            SET_C1(1);
-        else
-            partial_sw = 1 << 9;
-        return 1;
-    }
-    if (commit_sw)
-        SET_C1(0);
-    else
-        bits_to_clear = 1 << 9;
-    return 0;
-}
-
-static int fpu_exception_masked(int excep)
-{
-    if (excep == FPU_EXCEPTION_STACK_FAULT)
-        excep = FPU_EXCEPTION_INVALID_OPERATION;
-    return (fpu.control_word & excep);
-}
-
-static int fpu_push(floatx80 data)
-{
-    fpu.ftop = (fpu.ftop - 1) & 7;
-    fpu_set_st(0, data);
-    return 0;
-}
-static void fpu_pop()
-{
-    fpu_set_tag(0, FPU_TAG_EMPTY);
-    fpu.ftop = (fpu.ftop + 1) & 7;
-}
-
-static void fpu_update_pointers(uint32_t opcode)
-{
-    //if (VIRT_EIP() == 0x759783bb)
-    //    __asm__("int3");
-    fpu.fpu_cs = cpu->segregs[regcs];
-    fpu.fpu_eip = cpu->ip;
-    fpu.fpu_opcode = opcode;
-}
-static void fpu_update_pointers2(uint32_t opcode, uint32_t virtaddr, uint32_t seg)
-{
-    //if (VIRT_EIP() == 0x759783bb)
-    //    __asm__("int3");
-    fpu.fpu_cs = cpu->segregs[regcs];
-    fpu.fpu_eip = cpu->ip;
-    fpu.fpu_opcode = opcode;
-    fpu.fpu_data_ptr = virtaddr;
-    fpu.fpu_data_seg = cpu->segregs[seg];
-}
-
-#if 0
-static int read_float32(uint32_t linaddr, float32* dest)
-{
-    uint32_t low;
-    cpu_read32(linaddr, low, cpu.tlb_shift_read);
-    *dest = low;
-    return 0;
-}
+#ifdef MAX
+#undef MAX
 #endif
-static int write_float32(uint32_t linaddr, float32 src)
-{
-    cpu_writel(cpu, linaddr, src); // , cpu.tlb_shift_write);
-    return 0;
-}
-#if 0
-static int read_float64(uint32_t linaddr, float64* dest)
-{
-    uint32_t low, hi;
-    cpu_read32(linaddr, low, cpu.tlb_shift_read);
-    cpu_read32(linaddr + 4, hi, cpu.tlb_shift_read);
-    *dest = (uint64_t)low | (uint64_t)hi << 32;
-    return 0;
-}
-#endif
-static int write_float64(uint32_t linaddr, float64 dest)
-{
-    uint64_t x = dest;
-    cpu_writel(cpu, linaddr, (uint32_t)x); //, cpu.tlb_shift_write);
-    cpu_writel(cpu, linaddr + 4, (uint32_t)(x >> 32)); // , cpu.tlb_shift_write);
-    return 0;
+
+#define ROUNDDOWN(X, K) ((X) & -(K))
+#define ROUNDUP(X, K)   (((X) + (K)-1) & -(K))
+#define IS2POW(X)       (!((X) & ((X)-1)))
+#define ABS(X)          ((X) >= 0 ? (X) : -(X))
+#define MIN(X, Y)       ((Y) > (X) ? (X) : (Y))
+#define MAX(X, Y)       ((Y) < (X) ? (X) : (Y))
+#define ARRAYLEN(A) \
+  ((long)((sizeof(A) / sizeof(*(A))) / ((unsigned)!(sizeof(A) % sizeof(*(A))))))
+
+struct Machine fpum;
+
+u8 Read8(u32 addr) {
+    return cpu_read(fpum.cpu, addr);
 }
 
-static int fpu_check_push(void)
-{
-    if (fpu_check_stack_overflow(-1)) {
-        fpu_check_exceptions();
-        if (fpu.control_word & FPU_EXCEPTION_INVALID_OPERATION) {
-            // masked response
-            fpu_push(IndefiniteNaN);
-        }
-        else
-            fpu.status_word |= 0x80; // ?
-        return 1;
+u16 Read16(u32 addr) {
+    return cpu_readw(fpum.cpu, addr);
+}
+
+u32 Read32(u32 addr) {
+    return cpu_readl(fpum.cpu, addr);
+}
+
+u64 Read64(u32 addr) {
+    return (u64)cpu_readl(fpum.cpu, addr) | ((u64)cpu_readl(fpum.cpu, addr + 4) << 32);
+}
+
+void Read80(u8* dst, u32 addr) {
+    u32 val32;
+    u16 val16;
+    val32 = cpu_readl(fpum.cpu, addr);
+    memcpy(dst, &val32, 4);
+    val32 = cpu_readl(fpum.cpu, addr + 4);
+    memcpy(dst + 4, &val32, 4);
+    val16 = cpu_readw(fpum.cpu, addr + 8);
+    memcpy(dst + 8, &val16, 2);
+}
+
+void Write8(u32 addr, u8 val) {
+    cpu_write(fpum.cpu, addr, val);
+}
+
+void Write16(u32 addr, u16 val) {
+    cpu_writew(fpum.cpu, addr, val);
+}
+
+void Write32(u32 addr, u32 val) {
+    cpu_writel(fpum.cpu, addr, val);
+}
+
+void Write64(u32 addr, u64 val) {
+    cpu_writel(fpum.cpu, addr, val);
+    cpu_writel(fpum.cpu, addr + 4, val >> 32);
+}
+
+void Write80(u32 addr, u8* src) {
+    cpu_writel(fpum.cpu, addr, *(u32*)src);
+    cpu_writel(fpum.cpu, addr + 4, *(u32*)(src + 4));
+    cpu_writew(fpum.cpu, addr + 8, *(u16*)(src + 8));
+}
+
+void fpunew_init(CPU_t* cpu) {
+    fpum.cpu = cpu;
+}
+
+void OpUdImpl(struct Machine* m) {
+    //TODO
+}
+
+u8* SerializeLdbl(u8 b[10], double f) {
+    int e;
+    union DoublePun u = { f };
+    e = (u.i >> 52) & 0x7ff;
+    if (!e) {
+        e = 0;
     }
-    return 0;
-}
-
-static int fpu_store_f80(uint32_t linaddr, floatx80* data)
-{
-    uint16_t exponent;
-    uint64_t mantissa;
-    floatx80_unpack(data, exponent, mantissa);
-    int shift = 0; // cpu.tlb_shift_write;
-    cpu_writel(cpu, linaddr, (uint32_t)mantissa); //, shift);
-    cpu_writel(cpu, linaddr + 4, (uint32_t)(mantissa >> 32)); // , shift);
-    cpu_writew(cpu, linaddr + 8, exponent); // , shift);
-    return 0;
-}
-static int fpu_read_f80(uint32_t linaddr, floatx80* data)
-{
-    uint16_t exponent;
-    uint32_t low, hi;
-    int shift = 0; // cpu.tlb_shift_read;
-    low = cpu_readl(cpu, linaddr); // , low, shift);
-    hi = cpu_readl(cpu, linaddr + 4); //, hi, shift);
-    exponent = cpu_readw(cpu, linaddr + 8); // , exponent, shift);
-    floatx80_repack(data, exponent, (uint64_t)low | (uint64_t)hi << 32);
-    return 0;
-}
-
-// Actual FPU operations
-static int fpu_fcom(floatx80 op1, floatx80 op2, int unordered)
-{
-    int relation = floatx80_compare_internal(op1, op2, unordered, &fpu.status);
-    if (fpu_check_exceptions())
-        return 1;
-    int bad = relation == float_relation_unordered;
-    SET_C0(bad | (relation == float_relation_less));
-    SET_C2(bad);
-    SET_C3(bad | (relation == float_relation_equal));
-
-    return 0;
-}
-static int fpu_fcomi(floatx80 op1, floatx80 op2, int unordered)
-{
-    int relation = floatx80_compare_internal(op1, op2, unordered, &fpu.status);
-    if (fpu_check_exceptions())
-        return 1;
-    int bad = relation == float_relation_unordered;
-
-    int cf = bad | (relation == float_relation_less);
-    int pf = bad;
-    int zf = bad | (relation == float_relation_equal);
-    cpu_set_cf(cf);
-    cpu_set_pf(pf);
-    cpu_set_zf(zf);
-
-    return 0;
-}
-
-//void fpu_debug(void);
-static int fstenv(uint32_t linaddr, int code16)
-{
-    //fpu_debug();
-    for (int i = 0; i < 8; i++) {
-        if (fpu_get_tag(i) != FPU_TAG_EMPTY)
-            fpu_set_tag(i, fpu_get_tag_from_value(&fpu.st[(fpu.ftop + i) & 7]));
-    }
-    // https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-software-developer-vol-1-manual.pdf
-    // page 203
-    int x = 0; // cpu.tlb_shift_write;
-    //fpu_debug();
-    //__asm__("int3");
-    if (cpu->isoper32) {
-        cpu_writel(cpu, linaddr, 0xFFFF0000 | fpu.control_word); // , x);
-        cpu_writel(cpu, linaddr + 4, 0xFFFF0000 | fpu_get_status_word()); // , x);
-        cpu_writel(cpu, linaddr + 8, 0xFFFF0000 | fpu.tag_word); // , x);
-        if (cpu->cr[0] & 1) {
-            cpu_writel(cpu, linaddr + 12, fpu.fpu_eip); // , x);
-            cpu_writel(cpu, linaddr + 16, fpu.fpu_cs | (fpu.fpu_opcode << 16)); // , x);
-            cpu_writel(cpu, linaddr + 20, fpu.fpu_data_ptr); // , x);
-            cpu_writel(cpu, linaddr + 24, 0xFFFF0000 | fpu.fpu_data_seg); // , x);
-        }
-        else {
-            uint32_t linear_fpu_eip = fpu.fpu_eip + (fpu.fpu_cs << 4);
-            uint32_t linear_fpu_data = fpu.fpu_data_ptr + (fpu.fpu_data_seg << 4);
-            cpu_writel(cpu, linaddr + 12, linear_fpu_eip | 0xFFFF0000); // , x);
-            cpu_writel(cpu, linaddr + 16, (fpu.fpu_opcode & 0x7FF) | (linear_fpu_eip >> 4 & 0x0FFFF000)); // , x);
-            cpu_writel(cpu, linaddr + 20, linear_fpu_data | 0xFFFF0000); // , x);
-            cpu_writel(cpu, linaddr + 24, linear_fpu_data >> 4 & 0x0FFFF000); // , x);
-        }
+    else if (e == 0x7ff) {
+        e = 0x7fff;
     }
     else {
-        cpu_writew(cpu, linaddr, fpu.control_word); // , x);
-        cpu_writew(cpu, linaddr + 2, fpu_get_status_word()); // , x);
-        cpu_writew(cpu, linaddr + 4, fpu.tag_word); // , x);
-        if (cpu->cr[0] & 1) {
-            cpu_writew(cpu, linaddr + 6, fpu.fpu_eip); // , x);
-            cpu_writew(cpu, linaddr + 8, fpu.fpu_cs); // , x);
-            cpu_writew(cpu, linaddr + 10, fpu.fpu_data_ptr); // , x);
-            cpu_writew(cpu, linaddr + 12, fpu.fpu_data_seg); // , x);
-        }
-        else {
-            uint32_t linear_fpu_eip = fpu.fpu_eip + (fpu.fpu_cs << 4);
-            uint32_t linear_fpu_data = fpu.fpu_data_ptr + (fpu.fpu_data_seg << 4);
-            cpu_writew(cpu, linaddr + 6, linear_fpu_eip); // , x);
-            cpu_writew(cpu, linaddr + 8, (fpu.fpu_opcode & 0x7FF) | (linear_fpu_eip >> 4 & 0xF000)); // , x);
-            cpu_writew(cpu, linaddr + 10, linear_fpu_data); // , x);
-            cpu_writew(cpu, linaddr + 12, linear_fpu_data >> 4 & 0xF000); // , x);
-        }
+        e -= 0x3ff;
+        e += 0x3fff;
     }
-    return 0;
-}
-static int fldenv(uint32_t linaddr, int code16)
-{
-    uint32_t temp32;
-    if (!code16) {
-        temp32 = cpu_readl(cpu, linaddr); // , temp32, cpu.tlb_shift_read);
-        fpu_set_control_word(temp32);
-
-        fpu.status_word = cpu_readw(cpu, linaddr + 4); // , fpu.status_word, cpu.tlb_shift_read);
-        fpu.ftop = fpu.status_word >> 11 & 7;
-        fpu.status_word &= ~(7 << 11); // Clear FTOP.
-
-        fpu.tag_word = cpu_readw(cpu, linaddr + 8); // , fpu.tag_word, cpu.tlb_shift_read);
-        if (cpu->cr[0] & 1) {
-            fpu.fpu_eip = cpu_readl(cpu, linaddr + 12); // , fpu.fpu_eip, cpu.tlb_shift_read);
-
-            temp32 = cpu_readl(cpu, linaddr + 16); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_cs = temp32 & 0xFFFF;
-            fpu.fpu_opcode = temp32 >> 16 & 0x7FF;
-
-            fpu.fpu_data_ptr = cpu_readl(cpu, linaddr + 20); // , fpu.fpu_data_ptr, cpu.tlb_shift_read);
-            fpu.fpu_data_seg = cpu_readl(cpu, linaddr + 24); // , fpu.fpu_data_seg, cpu.tlb_shift_read);
-        }
-        else {
-            fpu.fpu_cs = 0;
-            fpu.fpu_eip = 0;
-            fpu.fpu_eip = cpu_readw(cpu, linaddr + 12); // , fpu.fpu_eip, cpu.tlb_shift_read);
-
-            temp32 = cpu_readl(cpu, linaddr + 16); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_opcode = temp32 & 0x7FF;
-            fpu.fpu_eip |= temp32 << 4 & 0xFFFF0000;
-
-            temp32 = cpu_readl(cpu, linaddr + 20); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_data_ptr = temp32 & 0xFFFF;
-
-            temp32 = cpu_readl(cpu, linaddr + 24); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_eip |= temp32 << 4 & 0xFFFF0000;
-        }
-    }
-    else {
-        temp32 = cpu_readw(cpu, linaddr); // , temp32, cpu.tlb_shift_read);
-        fpu_set_control_word(temp32);
-
-        fpu.status_word = cpu_readw(cpu, linaddr + 2); // , fpu.status_word, cpu.tlb_shift_read);
-        fpu.ftop = fpu.status_word >> 11 & 7;
-        fpu.status_word &= ~(7 << 11); // Clear FTOP.
-
-        fpu.tag_word = cpu_readw(cpu, linaddr + 4); // , fpu.tag_word, cpu.tlb_shift_read);
-        if (cpu->cr[0] & 1) {
-            fpu.fpu_eip = cpu_readw(cpu, linaddr + 6); // , fpu.fpu_eip, cpu.tlb_shift_read);
-            fpu.fpu_cs = cpu_readw(cpu, linaddr + 8); // , fpu.fpu_cs, cpu.tlb_shift_read);
-            fpu.fpu_data_ptr = cpu_readw(cpu, linaddr + 10); // , fpu.fpu_data_ptr, cpu.tlb_shift_read);
-            fpu.fpu_data_seg = cpu_readw(cpu, linaddr + 12); // , fpu.fpu_data_seg, cpu.tlb_shift_read);
-        }
-        else {
-            fpu.fpu_cs = 0;
-            fpu.fpu_eip = 0;
-            fpu.fpu_eip = cpu_readw(cpu, linaddr + 6); // , fpu.fpu_eip, cpu.tlb_shift_read);
-
-            temp32 = cpu_readw(cpu, linaddr + 8); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_opcode = temp32 & 0x7FF;
-            fpu.fpu_eip |= temp32 << 4 & 0xF0000;
-
-            temp32 = cpu_readw(cpu, linaddr + 10); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_data_ptr = temp32 & 0xFFFF;
-
-            temp32 = cpu_readl(cpu, linaddr + 12); // , temp32, cpu.tlb_shift_read);
-            fpu.fpu_eip |= temp32 << 4 & 0xF0000;
-        }
-    }
-    if (fpu.status_word & ~fpu.control_word & 0x3F)
-        fpu.status_word |= 0x8080;
-    else
-        fpu.status_word &= ~0x8080;
-    return 0;
+    *(u16*)(b + 8) = e | u.i >> 63 << 15;
+    *(u64*)(b) = (u.i & 0x000fffffffffffff) << 11 | (u64)!!u.f << 63;
+    return b;
 }
 
-static void fpu_watchpoint(void)
-{
-    // For debugging purposes
-    //if(VIRT_EIP() == 0x71961cad) __asm__("int3");
-    //if(fpu.st[5].fraction == 0x00000006e8b877f6) __asm__("int3");
-}
-static void fpu_watchpoint2(void)
-{
-    // For debugging purposes
-    //if(fpu.fpu_opcode == 0x77F8) __asm__("int3");
+double DeserializeLdbl(const u8 b[10]) {
+    union DoublePun u;
+    u.i = (u64)(MAX(-1023, MIN(1024, (((*(u16*)(b + 8)) & 0x7fff) - 0x3fff))) + 1023)
+        << 52 |
+        (((*(u64*)(b)) & 0x7fffffffffffffff) + (1 << (11 - 1))) >> 11 |
+        (u64)(b[9] >> 7) << 63;
+    return u.f;
 }
 
-#define FPU_EXCEP() return 1
-#define FPU_ABORT()        \
-    do {                   \
-        fpu_watchpoint2(); \
-        return 0;          \
-    } while (0) // Not an exception, so keep on goings
-
-// Run a FPU operation that does not require memory
-#define OP(op, reg) (op & 7) << 3 | reg
-int fpu_reg_op(struct decoded_instruction* i, uint32_t flags)
-{
-    UNUSED(flags);
-    UNUSED(fpu_exception_raised);
-    UNUSED(fpu_get_st_ptr);
-    //TODO: Have I fucked this function up badly?
-    // 
-    //uint32_t opcode = i->imm32;
-    uint32_t opcode = cpu->opcode;
-    floatx80 temp80;
-    //modregrm(cpu);
-    if (fpu_nm_check())
-        return 1;
-#ifdef INSTRUMENT
-    cpu_instrument_pre_fpu();
-#endif
-    fpu_watchpoint();
-
-    fpu.status.float_exception_flags = 0;
-    //int smaller_opcode = (opcode >> 5 & 0x38) | (opcode >> 3 & 7);
-    int smaller_opcode = (cpu->opcode & 7) << 3 | cpu->reg;
-
-    switch (smaller_opcode) {
-    case OP(0xD8, 0):
-    case OP(0xD8, 1):
-    case OP(0xD8, 4):
-    case OP(0xD8, 5):
-    case OP(0xD8, 6):
-    case OP(0xD8, 7):
-    case OP(0xDC, 0):
-    case OP(0xDC, 1):
-    case OP(0xDC, 4):
-    case OP(0xDC, 5):
-    case OP(0xDC, 6):
-    case OP(0xDC, 7):
-    case OP(0xDE, 0):
-    case OP(0xDE, 1):
-    case OP(0xDE, 4):
-    case OP(0xDE, 5):
-    case OP(0xDE, 6):
-    case OP(0xDE, 7): {
-        int st_index = cpu->opcode & 7;
-        floatx80 dst;
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(st_index, 1))
-            FPU_ABORT();
-
-        switch (smaller_opcode & 7) {
-        case 0: // FADD - Floating point add
-            dst = floatx80_add(fpu_get_st(0), fpu_get_st(st_index), &fpu.status);
-            break;
-        case 1: // FMUL - Floating point multiply
-            dst = floatx80_mul(fpu_get_st(0), fpu_get_st(st_index), &fpu.status);
-            break;
-        case 4: // FSUB - Floating point subtract
-            dst = floatx80_sub(fpu_get_st(0), fpu_get_st(st_index), &fpu.status);
-            break;
-        case 5: // FSUBR - Floating point subtract reverse
-            dst = floatx80_sub(fpu_get_st(st_index), fpu_get_st(0), &fpu.status);
-            break;
-        case 6: // FDIV - Floating point divide
-            dst = floatx80_div(fpu_get_st(0), fpu_get_st(st_index), &fpu.status);
-            break;
-        case 7: // FDIVR - Floating point divide reverse
-            dst = floatx80_div(fpu_get_st(st_index), fpu_get_st(0), &fpu.status);
-            break;
-        }
-        if (!fpu_check_exceptions()) {
-            if (smaller_opcode & 32) {
-                fpu_set_st(st_index, dst);
-                if (smaller_opcode & 16)
-                    fpu_pop();
-            }
-            else
-                fpu_set_st(0, dst);
-        }
-        break;
-    }
-    case OP(0xD8, 2): // FCOM - Floating point compare
-    case OP(0xD8, 3): // FCOMP - Floating point compare and pop
-    case OP(0xDC, 2):
-    case OP(0xDC, 3):
-    case OP(0xDE, 2): { // Aliases of the DB opcodes
-        if (fpu_fwait())
-            FPU_ABORT();
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(cpu->opcode & 7, 1)) {
-            SET_C0(1);
-            SET_C2(1);
-            SET_C3(1);
-        }
-        fpu_update_pointers(cpu->opcode);
-        if (!fpu_fcom(fpu_get_st(0), fpu_get_st(cpu->opcode & 7), 0)) {
-            if (smaller_opcode & 1 || smaller_opcode == (OP(0xDE, 2)))
-                fpu_pop();
-        }
-        break;
-    }
-    case OP(0xD9, 0): // FLD - Load floating point value
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(cpu->opcode & 7, 1) || fpu_check_push())
-            FPU_ABORT();
-        temp80 = fpu_get_st(cpu->opcode & 7);
-        fpu_push(temp80);
-        break;
-    case OP(0xD9, 1): // FXCH - Floating point exchange
-    case OP(0xDD, 1):
-    case OP(0xDF, 1): // alias of FXCH
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(1, 1))
-            FPU_ABORT();
-        temp80 = fpu_get_st(0);
-        fpu_set_st(0, fpu_get_st(cpu->opcode & 7));
-        fpu_set_st(cpu->opcode & 7, temp80);
-        break;
-    case OP(0xD9, 2): // FNOP
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        break;
-    case OP(0xD9, 4):
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        if ((cpu->opcode & 7) != 5)
-            if (fpu_check_stack_underflow(0, 1))
-                FPU_ABORT();
-        temp80 = fpu_get_st(0);
-        switch (cpu->opcode & 7) {
-        case 0: // FCHS - Flip sign of floating point number
-            floatx80_chs(&temp80);
-            break;
-        case 1: // FABS - Find absolute value of floating point number
-            floatx80_abs(&temp80);
-            break;
-        case 4: // FTST - Compare floating point register to 0
-            if (fpu_fcom(temp80, Zero, 0))
-                FPU_ABORT();
-            return 0;
-        case 5: { // FXAM - Examine floating point number
-            int unordered = 0;
-            uint16_t exponent;
-            uint64_t mantissa;
-            floatx80_unpack(&temp80, exponent, mantissa);
-            if (fpu_get_tag(0) == FPU_TAG_EMPTY)
-                unordered = 5;
-            else {
-                if (is_invalid(exponent, mantissa))
-                    unordered = 0;
-                else if (is_nan(exponent, mantissa))
-                    unordered = 1;
-                else if (is_infinity(exponent, mantissa))
-                    unordered = 3;
-                else if (is_zero_any_sign(exponent, mantissa))
-                    unordered = 4;
-                else if (is_denormal(exponent, mantissa))
-                    unordered = 6;
-                else
-                    unordered = 2;
-            }
-            SET_C0(unordered & 1);
-            SET_C1(exponent >> 15 & 1); // Get sign
-            SET_C2(unordered >> 1 & 1);
-            SET_C3(unordered >> 2 & 1);
-            return 0;
-        }
-        }
-        fpu_set_st(0, temp80);
-        break;
-    case OP(0xD9, 5): // FLD - Load floating point constants
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-
-        if (fpu_check_push())
-            FPU_ABORT();
-        fpu_push(*Constants[cpu->opcode & 7]);
-        break;
-    case OP(0xD9, 6): { // Various complex FPU operations
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        floatx80 res, temp;
-        int temp2, old_rounding;
-        switch (cpu->opcode & 7) {
-        case 0: // D9 F0: F2XM1 - Compute 2^ST(0) - 1
-            if (fpu_check_stack_underflow(0, 1))
-                FPU_ABORT();
-            res = f2xm1(fpu_get_st(0), &fpu.status);
-            if (!fpu_check_exceptions())
-                fpu_set_st(0, res);
-            break;
-        case 1: // D9 F1: FYL2X - Compute ST(1) * log2(ST(0)) and then pop
-            if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(1, 1))
-                FPU_ABORT();
-
-            old_rounding = fpu.status.float_rounding_precision;
-            fpu.status.float_rounding_precision = 80;
-            res = fyl2x(fpu_get_st(0), fpu_get_st(1), &fpu.status);
-            fpu.status.float_rounding_precision = old_rounding;
-
-            if (!fpu_check_exceptions()) {
-                fpu_set_st(1, res);
-                fpu_pop();
-            }
-            break;
-        case 2: // D9 F2: FPTAN - Compute tan(ST(0)) partially
-            if (fpu_check_stack_underflow(0, 1))
-                FPU_ABORT();
-            res = fpu_get_st(0);
-            if (!ftan(&res, &fpu.status))
-                fpu_set_st(0, res);
-            break;
-        case 3: // D9 F3: FPATAN - Compute tan-1(ST(0)) partially
-            if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(1, 1))
-                FPU_ABORT();
-            res = fpatan(fpu_get_st(0), fpu_get_st(1), &fpu.status);
-            if (!fpu_check_exceptions()) {
-                fpu_pop();
-                fpu_set_st(0, res);
-            }
-            break;
-        case 4: // D9 F4: FXTRACT - Extract Exponent and mantissa of ST0
-            if (fpu_check_stack_underflow(0, 1))
-                FPU_ABORT();
-            if (fpu_check_stack_overflow(-1))
-                FPU_ABORT();
-            temp = fpu_get_st(0);
-            res = floatx80_extract(&temp, &fpu.status);
-            if (!fpu_check_exceptions()) {
-                fpu_set_st(0, res);
-                fpu_push(temp);
-            }
-            break;
-        case 5: { // D9 F5: FPREM1 - Partial floating point remainder
-            floatx80 st0 = fpu_get_st(0), st1 = fpu_get_st(1);
-            uint64_t quo;
-            temp2 = floatx80_ieee754_remainder(st0, st1, &temp, &quo, &fpu.status);
-            if (!fpu_check_exceptions()) {
-                if (!(temp2 < 0)) {
-                    SET_C0(0);
-                    SET_C2(0);
-                    SET_C3(0);
-                    if (temp2 > 0) {
-                        SET_C2(1);
-                    }
-                    else {
-                        // 1 2 4 - 1 3 0
-                        if (quo & 1)
-                            SET_C1(1);
-                        if (quo & 2)
-                            SET_C3(1);
-                        if (quo & 4)
-                            SET_C0(1);
-                    }
-                }
-                fpu_set_st(0, temp);
-            }
-            break;
-        case 6: // D9 F6: FDECSTP - Decrement stack pointer
-            SET_C1(0);
-            fpu.ftop = (fpu.ftop - 1) & 7;
-            break;
-        case 7: // D9 F7: FINCSTP - Increment stack pointer
-            SET_C1(0);
-            fpu.ftop = (fpu.ftop + 1) & 7;
-            break;
-        }
-        }
-        break;
-    }
-    case OP(0xD9, 7): {
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-
-        // Check for FPU registers
-        if (fpu_check_stack_underflow(0, 1))
-            FPU_ABORT();
-
-        int flags, pop = 0;
-        floatx80 dest;
-        uint64_t quotient;
-        switch (cpu->opcode & 7) {
-        case 0: // FPREM - Floating point partial remainder (8087/80287 compatible)
-            if (fpu_check_stack_underflow(1, 1))
-                FPU_ABORT();
-            flags = floatx80_remainder(fpu_get_st(0), fpu_get_st(1), &dest, &quotient, &fpu.status);
-            if (!fpu_check_exceptions()) {
-                if (flags < 0) {
-                    SET_C0(0);
-                    SET_C1(0);
-                    SET_C2(0);
-                    SET_C3(0);
-                }
-                else {
-                    if (flags != 0) {
-                        SET_C0(0);
-                        SET_C1(0);
-                        SET_C2(1);
-                        SET_C3(0);
-                    }
-                    else {
-                        SET_C0(quotient >> 2 & 1);
-                        SET_C1(quotient & 1);
-                        SET_C2(0);
-                        SET_C3(quotient >> 1 & 1);
-                    }
-                }
-                fpu_set_st(0, dest);
-            }
-            break;
-        case 1: // FYL2XP1 - Compute ST1 * log2(ST0 + 1) and pop
-            if (fpu_check_stack_underflow(1, 1))
-                FPU_ABORT();
-            dest = fyl2xp1(fpu_get_st(0), fpu_get_st(1), &fpu.status);
-            if (!fpu_check_exceptions()) {
-                fpu_pop();
-                fpu_set_st(0, dest);
-            }
-            return 0;
-        case 2: // FSQRT - Compute sqrt(ST0)
-            dest = floatx80_sqrt(fpu_get_st(0), &fpu.status);
-            break;
-        case 3: { // FSINCOS - Compute sin(ST0) and sin(ST1)
-            // TODO: What if exceptions are masked?
-            if (fpu_check_stack_overflow(-1))
-                FPU_ABORT();
-            floatx80 sinres, cosres;
-            if (fsincos(fpu_get_st(0), &sinres, &cosres, &fpu.status) == -1) {
-                SET_C2(1);
-            }
-            else if (!fpu_check_exceptions()) {
-                fpu_set_st(0, sinres);
-                fpu_push(cosres);
-            }
-            return 0;
-        }
-        case 4: // FRNDINT - Round ST0
-            dest = floatx80_round_to_int(fpu_get_st(0), &fpu.status);
-            break;
-        case 5: // FSCALE - Scale ST0
-            if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(1, 1))
-                FPU_ABORT();
-            dest = floatx80_scale(fpu_get_st(0), fpu_get_st(1), &fpu.status);
-            break;
-        case 6: // FSIN - Find sine of ST0
-            dest = fpu_get_st(0);
-            if (fsin(&dest, &fpu.status) == -1) {
-                SET_C2(1);
-                FPU_ABORT();
-            }
-            break;
-        case 7: // FCOS - Find cosine of ST0
-            dest = fpu_get_st(0);
-            if (fcos(&dest, &fpu.status) == -1) {
-                SET_C2(1);
-                FPU_ABORT();
-            }
-            break;
-        }
-        if (!fpu_check_exceptions()) {
-            fpu_set_st(0, dest);
-            if (pop)
-                fpu_pop();
-        }
-        break;
-    }
-    case OP(0xDA, 0):
-    case OP(0xDB, 0): // FCMOV(N)B - Move floating point to register ST0 if condition code is set
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) && fpu_check_stack_underflow(cpu->opcode & 7, 1))
-            FPU_ABORT();
-        if (cpu_get_cf() ^ (smaller_opcode >> 3 & 1))
-            fpu_set_st(0, fpu_get_st(cpu->opcode & 7));
-        break;
-    case OP(0xDB, 1):
-    case OP(0xDA, 1): // FCMOV(N)E - Move floating point to register ST0 if condition code is set
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) && fpu_check_stack_underflow(cpu->opcode & 7, 1))
-            FPU_ABORT();
-        if (cpu_get_zf() ^ (smaller_opcode >> 3 & 1))
-            fpu_set_st(0, fpu_get_st(cpu->opcode & 7));
-        break;
-    case OP(0xDB, 2):
-    case OP(0xDA, 2): // FCMOV(N)BE - Move floating point to register ST0 if condition code is set
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) && fpu_check_stack_underflow(cpu->opcode & 7, 1))
-            FPU_ABORT();
-        if ((cpu_get_zf() || cpu_get_cf()) ^ (smaller_opcode >> 3 & 1))
-            fpu_set_st(0, fpu_get_st(cpu->opcode & 7));
-        break;
-    case OP(0xDB, 3):
-    case OP(0xDA, 3): // FCMOV(N)U - Move floating point to register ST0 if condition code is set
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) && fpu_check_stack_underflow(cpu->opcode & 7, 1))
-            FPU_ABORT();
-        if (cpu_get_pf() ^ (smaller_opcode >> 3 & 1))
-            fpu_set_st(0, fpu_get_st(cpu->opcode & 7));
-        break;
-    case OP(0xDA, 5): // FUCOMPP
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if ((cpu->opcode & 7) == 1) {
-            if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(1, 1)) {
-                SET_C0(1);
-                SET_C2(1);
-                SET_C3(1);
-            }
-            if (fpu_fcom(fpu_get_st(0), fpu_get_st(1), 1))
-                FPU_ABORT();
-
-            if (!fpu_check_exceptions()) {
-                fpu_pop();
-                fpu_pop();
-            }
-        }
-        break;
-    case OP(0xDB, 4):
-        switch (cpu->opcode & 7) {
-        case 0: case 1:
-        case 4:
-            // All 286 opcodes, nop
-            return 0;
-        case 2: // DB E2: FNCLEX - Clear FPU exceptions
-            fpu.status_word &= ~(0x80FF);
-            break;
-        case 3: // DB E3: FNINIT - Reset Floating point state
-            fninit();
-            break;
-        //default:
-            //EXCEPTION_UD(); //TODO
-        }
-        break;
-    case OP(0xDB, 5):
-    case OP(0xDB, 6): // F(U)COMI : Do an (un)ordered compare, and set EFLAGS.
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-
-        decodeflagsword(cpu, (makeflagsword(cpu) & ~(EFLAGS_OF | EFLAGS_SF | EFLAGS_ZF | EFLAGS_AF | EFLAGS_PF | EFLAGS_CF)));
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(cpu->opcode & 7, 1)) {
-            cpu_set_zf(1);
-            cpu_set_pf(1);
-            cpu_set_cf(1);
-            FPU_ABORT();
-        }
-        if (fpu_fcomi(fpu_get_st(0), fpu_get_st(cpu->opcode & 7), smaller_opcode & 1))
-            FPU_ABORT();
-        break;
-    case OP(0xD9, 3): // FSTP (alias)
-    case OP(0xDD, 2): // FST - Store floating point value
-    case OP(0xDD, 3):
-    case OP(0xDF, 2):
-    case OP(0xDF, 3): { // FSTP - Store floating point value and pop
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1)) {
-            if (fpu_exception_masked(FPU_EXCEPTION_STACK_FAULT))
-                fpu_pop();
-            FPU_ABORT();
-        }
-        fpu_set_st(cpu->opcode & 7, fpu_get_st(0));
-        if (smaller_opcode & 1 || (smaller_opcode & ~1) == (OP(0xDF, 2)))
-            fpu_pop();
-        break;
-    }
-    case OP(0xDD, 0): // FFREE - Free floating point value
-    case OP(0xDF, 0): { // FFREEP - Free floaing point value and pop
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        fpu_set_tag(cpu->opcode & 7, FPU_TAG_EMPTY);
-        if (smaller_opcode == (OP(0xDF, 0)))
-            fpu_pop();
-        break;
-    }
-    case OP(0xDD, 4): // FUCOM - Unordered compare
-    case OP(0xDD, 5): // FUCOMP
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(cpu->opcode & 7, 1)) {
-            SET_C0(1);
-            SET_C2(1);
-            SET_C3(1);
-        }
-        if (fpu_fcom(fpu_get_st(0), fpu_get_st(cpu->opcode & 7), 1))
-            FPU_ABORT();
-
-        if (!fpu_check_exceptions()) {
-            if (smaller_opcode & 1)
-                fpu_pop();
-        }
-        break;
-    case OP(0xDE, 3): // FCOMPP - Floating point compare and pop twice
-        if (fpu_fwait())
-            FPU_ABORT();
-        fpu_update_pointers(cpu->opcode);
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(cpu->opcode & 7, 1)) {
-            if (!fpu_check_exceptions()) {
-                // Masked response
-                SET_C0(1);
-                SET_C2(1);
-                SET_C3(1);
-            }
-            FPU_ABORT();
-        }
-        if (fpu_fcom(fpu_get_st(0), fpu_get_st(1), 0))
-            FPU_ABORT();
-        fpu_pop();
-        fpu_pop();
-        break;
-    case OP(0xDF, 4): // FSTSW - Store status word
-        //TODO: This exception
-        //if ((opcode & 7) != regeax)
-        //    EXCEPTION_UD();
-        //cpu.reg16[AX] = fpu_get_status_word();
-        cpu->regs.wordregs[regax] = fpu_get_status_word();
-        break;
-
-    case OP(0xDF, 5): // FUCOMIP - Unordered compare and pop
-    case OP(0xDF, 6): { // FCOMIP - Ordered compare and pop
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers(opcode);
-        // Clear all flags
-        decodeflagsword(cpu, (makeflagsword(cpu) & ~(EFLAGS_OF | EFLAGS_SF | EFLAGS_ZF | EFLAGS_AF | EFLAGS_PF | EFLAGS_CF)));
-
-        if (fpu_check_stack_underflow(0, 1) || fpu_check_stack_underflow(opcode & 7, 1)) {
-            cpu_set_zf(1);
-            cpu_set_pf(1);
-            cpu_set_cf(1);
-            FPU_ABORT();
-        }
-        if (fpu_fcomi(fpu_get_st(0), fpu_get_st(opcode & 7), smaller_opcode & 1))
-            FPU_ABORT();
-        fpu_pop();
-        break;
-    }
-    case OP(0xDA, 4):
-    case OP(0xDA, 6):
-    case OP(0xDA, 7):
-    case OP(0xDD, 6):
-    case OP(0xDD, 7):
-    case OP(0xDF, 7): { // Invalid
-        int major_opcode = opcode >> 8 | 0xD8;
-        UNUSED(major_opcode); // In case log is disabled
-        //CPU_LOG("Unknown FPU register operation: %02x %02x [%02x /%d] internal=%d\n", major_opcode, opcode & 0xFF, major_opcode, opcode >> 3 & 7, (opcode >> 5 & 0x38) | (opcode >> 3 & 7));
-        //EXCEPTION_UD(); //TODO
-        break;
-    }
-    default: {
-        int major_opcode = opcode >> 8 | 0xD8;
-        //CPU_FATAL("Unknown FPU register operation: %02x %02x [%02x /%d] internal=%d\n", major_opcode, opcode & 0xFF, major_opcode, opcode >> 3 & 7, (opcode >> 5 & 0x38) | (opcode >> 3 & 7));
-    }
-    }
-    fpu_watchpoint2();
-    return 0;
+static i16 FpuGetMemoryShort(struct Machine* m) {
+    //u8 b[2];
+    //return Read16(Load(m, m->fpu.dp, 2, b));
+    return Read16(m->fpu.dp); //TODO: Is this right? This guy's code is full of confusing, unnecessary abstractions...
 }
 
-int fpu_mem_op(struct decoded_instruction* i, uint32_t virtaddr, uint32_t seg)
-{
-    //uint32_t opcode = i->imm32, linaddr = virtaddr + cpu.seg_base[seg];
-    uint32_t opcode = cpu->opcode;
-    uint32_t linaddr = virtaddr + cpu->segcache[seg]; //TODO: Is this right?
-    floatx80 temp80;
-    float64 temp64;
-    float32 temp32;
+static void FpuSetMemoryShort(struct Machine* m, i16 i) {
+    //void* p[2];
+    //u8 b[2];
+    //Write16(BeginStore(m, m->fpu.dp, 2, p, b), i);
+    //EndStore(m, m->fpu.dp, 2, p, b);
+    Write16(m->fpu.dp, i); //TODO?
+}
 
-    if (fpu_nm_check())
-        return 1;
+static void OpFstcw(struct Machine* m) {
+    FpuSetMemoryShort(m, m->fpu.cw);
+}
 
-#ifdef INSTRUMENT
-    cpu_instrument_pre_fpu();
-#endif
+static void OpFldcw(struct Machine* m) {
+    m->fpu.cw = FpuGetMemoryShort(m);
+}
 
-    fpu_watchpoint();
-    //modregrm(cpu);
+#ifndef DISABLE_X87
 
-    fpu.status.float_exception_flags = 0;
-    //int smaller_opcode = (opcode >> 5 & 0x38) | (opcode >> 3 & 7);
-    int smaller_opcode = (opcode & 7) << 3 | cpu->reg; //TODO: Is this right?
-    switch (smaller_opcode) {
-        // Basic arithmetic
+static void OnFpuStackOverflow(struct Machine* m) {
+    m->fpu.sw |= kFpuSwIe | kFpuSwC1 | kFpuSwSf;
+}
 
-    case OP(0xD8, 0):
-    case OP(0xD8, 1):
-    case OP(0xD8, 2):
-    case OP(0xD8, 3):
-    case OP(0xD8, 4):
-    case OP(0xD8, 5):
-    case OP(0xD8, 6):
-    case OP(0xD8, 7):
-    case OP(0xD9, 0):
-    case OP(0xDA, 0):
-    case OP(0xDA, 1):
-    case OP(0xDA, 2):
-    case OP(0xDA, 3):
-    case OP(0xDA, 4):
-    case OP(0xDA, 5):
-    case OP(0xDA, 6):
-    case OP(0xDA, 7):
-    case OP(0xDB, 0):
-    case OP(0xDC, 0):
-    case OP(0xDC, 1):
-    case OP(0xDC, 2):
-    case OP(0xDC, 3):
-    case OP(0xDC, 4):
-    case OP(0xDC, 5):
-    case OP(0xDC, 6):
-    case OP(0xDC, 7):
-    case OP(0xDD, 0):
-    case OP(0xDE, 0):
-    case OP(0xDE, 1):
-    case OP(0xDE, 2):
-    case OP(0xDE, 3):
-    case OP(0xDE, 4):
-    case OP(0xDE, 5):
-    case OP(0xDE, 6):
-    case OP(0xDE, 7):
-    case OP(0xDF, 0): {
-        //printf("%08x %02x /%d\n", cpu.phys_eip, (smaller_opcode >> 3) | 0xD8, opcode & 7);
-        //if(cpu.phys_eip == 0x0018b3f0) __asm__("int3");
-        if (fpu_fwait())
-            return 1;
-        switch (opcode >> 9 & 3) {
+static double OnFpuStackUnderflow(struct Machine* m) {
+    m->fpu.sw |= kFpuSwIe | kFpuSwSf;
+    m->fpu.sw &= ~kFpuSwC1;
+    return -NAN;
+}
+
+static double St(struct Machine* m, int i) {
+    if (FpuGetTag(m, i) == kFpuTagEmpty) OnFpuStackUnderflow(m);
+    return *FpuSt(m, i);
+}
+
+static double St0(struct Machine* m) {
+    return St(m, 0);
+}
+
+static double St1(struct Machine* m) {
+    return St(m, 1);
+}
+
+static double StRm(struct Machine* m, u64 rde) {
+    return St(m, ModrmRm(rde));
+}
+
+static void FpuClearRoundup(struct Machine* m) {
+    m->fpu.sw &= ~kFpuSwC1;
+}
+
+static void FpuClearOutOfRangeIndicator(struct Machine* m) {
+    m->fpu.sw &= ~kFpuSwC2;
+}
+
+static void FpuSetSt0(struct Machine* m, double x) {
+    *FpuSt(m, 0) = x;
+}
+
+static void FpuSetStRm(struct Machine* m, u64 rde, double x) {
+    *FpuSt(m, ModrmRm(rde)) = x;
+}
+
+static void FpuSetStPop(struct Machine* m, int i, double x) {
+    *FpuSt(m, i) = x;
+    FpuPop(m);
+}
+
+static void FpuSetStRmPop(struct Machine* m, u64 rde, double x) {
+    FpuSetStPop(m, ModrmRm(rde), x);
+}
+
+static i32 FpuGetMemoryInt(struct Machine* m) {
+    //u8 b[4];
+    //return Read32(Load(m, m->fpu.dp, 4, b));
+    return Read32(m->fpu.dp);
+}
+
+static i64 FpuGetMemoryLong(struct Machine* m) {
+    //u8 b[8];
+    //return Read64(Load(m, m->fpu.dp, 8, b));
+    return Read64(m->fpu.dp);
+}
+
+static float FpuGetMemoryFloat(struct Machine* m) {
+    union FloatPun u;
+    u.i = FpuGetMemoryInt(m);
+    return u.f;
+}
+
+static double FpuGetMemoryDouble(struct Machine* m) {
+    union DoublePun u;
+    u.i = FpuGetMemoryLong(m);
+    return u.f;
+}
+
+static void FpuSetMemoryInt(struct Machine* m, i32 i) {
+    //void* p[2];
+    //u8 b[4];
+    //Write32(BeginStore(m, m->fpu.dp, 4, p, b), i);
+    //EndStore(m, m->fpu.dp, 4, p, b);
+    Write32(m->fpu.dp, i);
+}
+
+static void FpuSetMemoryLong(struct Machine* m, i64 i) {
+    //void* p[2];
+    //u8 b[8];
+    //Write64(BeginStore(m, m->fpu.dp, 8, p, b), i);
+    //EndStore(m, m->fpu.dp, 8, p, b);
+    Write64(m->fpu.dp, i);
+}
+
+static void FpuSetMemoryFloat(struct Machine* m, float f) {
+    union FloatPun u = { f };
+    FpuSetMemoryInt(m, u.i);
+}
+
+static void FpuSetMemoryDouble(struct Machine* m, double f) {
+    union DoublePun u = { f };
+    FpuSetMemoryLong(m, u.i);
+}
+
+static double FpuGetMemoryLdbl(struct Machine* m) {
+    u8 b[10];
+    Read80(b, m->fpu.dp);
+    return DeserializeLdbl(b);
+}
+
+static void FpuSetMemoryLdbl(struct Machine* m, double f) {
+    void* p[2];
+    u8 b[10], t[10];
+    SerializeLdbl(b, f);
+    //memcpy(BeginStore(m, m->fpu.dp, 10, p, t), b, 10);
+    //EndStore(m, m->fpu.dp, 10, p, t);
+    Write80(m->fpu.dp, b);
+}
+
+static double f2xm1(double x) {
+    return exp2(x) - 1;
+}
+
+static double fyl2x(double x, double y) {
+    return y * log2(x);
+}
+
+static double fyl2xp1(double x, double y) {
+    return y * log2(x + 1);
+}
+
+static double fscale(double significand, double exponent) {
+    if (isunordered(significand, exponent)) return NAN;
+    return ldexp(significand, exponent);
+}
+
+static double x87remainder(double x, double y, u32* sw,
+    double rem(double, double), double rnd(double)) {
+    int s;
+    long q;
+    double r;
+    s = 0;
+    r = rem(x, y);
+    q = rnd(x / y);
+    s &= ~kFpuSwC2; /* ty libm */
+    if (q & 1) s |= kFpuSwC1;
+    if (q & 2) s |= kFpuSwC3;
+    if (q & 4) s |= kFpuSwC0;
+    if (sw) *sw = s | (*sw & ~(kFpuSwC0 | kFpuSwC1 | kFpuSwC2 | kFpuSwC3));
+    return r;
+}
+
+static double fprem(double dividend, double modulus, u32* sw) {
+    return x87remainder(dividend, modulus, sw, fmod, trunc);
+}
+
+static double fprem1(double dividend, double modulus, u32* sw) {
+    return x87remainder(dividend, modulus, sw, remainder, rint);
+}
+
+static double FpuAdd(struct Machine* m, double x, double y) {
+    if (!isunordered(x, y)) {
+        switch (isinf(y) << 1 | isinf(x)) {
         case 0:
-            temp32 = cpu_readl(cpu, linaddr); // , temp32, cpu.tlb_shift_read);
-            temp80 = float32_to_floatx80(temp32, &fpu.status);
-            break;
+            return x + y;
         case 1:
-            temp32 = cpu_readl(cpu, linaddr); // , temp32, cpu.tlb_shift_read);
-            temp80 = int32_to_floatx80(temp32);
-            break;
-        case 2: {
-            uint32_t low, hi;
-            uint64_t res;
-            low = cpu_readl(cpu, linaddr); // , low, cpu.tlb_shift_read);
-            hi = cpu_readl(cpu, linaddr + 4); // , hi, cpu.tlb_shift_read);
-            res = (uint64_t)low | (uint64_t)hi << 32;
-            temp80 = float64_to_floatx80(res, &fpu.status);
-            break;
+            return x;
+        case 2:
+            return y;
+        case 3:
+            if (signbit(x) == signbit(y)) {
+                return x;
+            }
+            else {
+                m->fpu.sw |= kFpuSwIe;
+                return copysign(NAN, x);
+            }
+        default:
+            __builtin_unreachable();
         }
-        case 3: {
-            temp32 = cpu_readw(cpu, linaddr); // , temp32, cpu.tlb_shift_read);
-            temp80 = int32_to_floatx80((int16_t)temp32);
-            break;
-        }
-        }
-        fpu_update_pointers2(opcode, virtaddr, seg);
+    }
+    else {
+        return NAN;
+    }
+}
 
-        // Make sure we won't stack fault
-        int op = smaller_opcode & 15;
-        if ((op & 8) == 0) { // Don't do this for ST0
-            if (fpu_check_stack_underflow(0, 1)) {
-                if ((smaller_opcode & 14) == 2) {
-                    // For FCOM/FCOMP, set condition codes to 1
-                    SET_C0(1);
-                    SET_C2(1);
-                    SET_C3(1);
-                }
-                return 0;
+static double FpuSub(struct Machine* m, double x, double y) {
+    if (!isunordered(x, y)) {
+        switch (isinf(y) << 1 | isinf(x)) {
+        case 0:
+            return x - y;
+        case 1:
+            return -x;
+        case 2:
+            return y;
+        case 3:
+            if (signbit(x) == signbit(y)) {
+                m->fpu.sw |= kFpuSwIe;
+                return copysign(NAN, x);
+            }
+            else {
+                return y;
+            }
+        default:
+            __builtin_unreachable();
+        }
+    }
+    else {
+        return NAN;
+    }
+}
+
+static double FpuMul(struct Machine* m, double x, double y) {
+    if (!isunordered(x, y)) {
+        if (!((isinf(x) && !y) || (isinf(y) && !x))) {
+            return x * y;
+        }
+        else {
+            m->fpu.sw |= kFpuSwIe;
+            return -NAN;
+        }
+    }
+    else {
+        return NAN;
+    }
+}
+
+static double FpuDiv(struct Machine* m, double x, double y) {
+    if (!isunordered(x, y)) {
+        if (x || y) {
+            if (y) {
+                return x / y;
+            }
+            else {
+                m->fpu.sw |= kFpuSwZe;
+                return copysign(INFINITY, x);
             }
         }
         else {
-            if (fpu_check_push())
-                FPU_ABORT();
+            m->fpu.sw |= kFpuSwIe;
+            return copysign(NAN, x);
         }
-        floatx80 st0 = fpu_get_st(0);
-        switch (op) {
-        case 0: // FADD - Floating point add
-            st0 = floatx80_add(st0, temp80, &fpu.status);
-            break;
-        case 1: // FMUL - Floating point multiply
-            st0 = floatx80_mul(st0, temp80, &fpu.status);
-            break;
-        case 2: // FCOM - Floating point compare
-        case 3: // FCOMP - Floating point compare and pop
-            if (!fpu_fcom(st0, temp80, 0)) {
-                if (smaller_opcode & 1)
-                    fpu_pop();
-            }
-            return 0;
-        case 4: // FSUB - Floating point subtract
-            st0 = floatx80_sub(st0, temp80, &fpu.status);
-            break;
-        case 5: // FSUBR - Floating point subtract with reversed operands
-            st0 = floatx80_sub(temp80, st0, &fpu.status);
-            break;
-        case 6: // FDIV - Floating point divide
-            st0 = floatx80_div(st0, temp80, &fpu.status);
-            break;
-        case 7: // FDIVR - Floating point divide with reversed operands
-            st0 = floatx80_div(temp80, st0, &fpu.status);
-            break;
-        default: // FLD
-            if (!fpu_check_exceptions())
-                fpu_push(temp80);
-            return 0;
-        }
-        if (!fpu_check_exceptions())
-            fpu_set_st(0, st0);
-        break;
     }
+    else {
+        return NAN;
+    }
+}
 
-    case OP(0xD9, 2): // FST - Store floating point register
-    case OP(0xD9, 3): { // FSTP m64 - Store floating point register and pop
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers2(opcode, virtaddr, seg);
+static double FpuRound(struct Machine* m, double x) {
+    switch ((m->fpu.cw & kFpuCwRc) >> 10) {
+    case 0:
+        return rint(x);
+    case 1:
+        return floor(x);
+    case 2:
+        return ceil(x);
+    case 3:
+        return trunc(x);
+    default:
+        __builtin_unreachable();
+    }
+}
 
-        if (fpu_check_stack_underflow(0, 0))
-            FPU_ABORT();
-        temp32 = floatx80_to_float32(fpu_get_st(0), &fpu.status);
-        if (!fpu_check_exceptions2(0)) {
-            if (write_float32(linaddr, temp32))
-                FPU_EXCEP();
-            fpu_commit_sw();
-            if (smaller_opcode & 1)
-                fpu_pop();
-        }
-        break;
+static void FpuCompare(struct Machine* m, double y) {
+    double x = St0(m);
+    m->fpu.sw &= ~(kFpuSwC0 | kFpuSwC1 | kFpuSwC2 | kFpuSwC3);
+    if (!isunordered(x, y)) {
+        if (x < y) m->fpu.sw |= kFpuSwC0;
+        if (x == y) m->fpu.sw |= kFpuSwC3;
     }
-    case OP(0xD9, 5): { // FLDCW
-        uint16_t cw;
-        cw = cpu_readw(cpu, linaddr); //cw, cpu.tlb_shift_read);
-        fpu_set_control_word(cw);
-        break;
+    else {
+        m->fpu.sw |= kFpuSwC0 | kFpuSwC2 | kFpuSwC3 | kFpuSwIe;
     }
-    case OP(0xD9, 6): { // FSTENV
-        int is16 = !cpu->isoper32; // I_OP2(i->flags); //TODO: Is this right?
-        if (fstenv(linaddr, is16))
-            FPU_ABORT();
-        break;
+}
+
+static void OpFxam(struct Machine* m) {
+    double x;
+    x = *FpuSt(m, 0);
+    m->fpu.sw &= ~(kFpuSwC0 | kFpuSwC1 | kFpuSwC2 | kFpuSwC3);
+    if (signbit(x)) m->fpu.sw |= kFpuSwC1;
+    if (FpuGetTag(m, 0) == kFpuTagEmpty) {
+        m->fpu.sw |= kFpuSwC0 | kFpuSwC3;
     }
-    case OP(0xD9, 7): // FSTCW - Store control word to memory
-        cpu_writew(cpu, linaddr, fpu.control_word); // , cpu.tlb_shift_write);
-        break;
-    case OP(0xDB, 1): // FISTTP - Store floating point register (truncate to 0) to memory and pop
-    case OP(0xDB, 2): // FIST - Store floating point register (converted to integer) to memory
-    case OP(0xDB, 3): // FISTP - Store floating point register (converted to integer) to memory and pop
-    case OP(0xDD, 1): // FISTTP
-    case OP(0xDF, 1):
-    case OP(0xDF, 2):
-    case OP(0xDF, 3): {
-        if (fpu_fwait())
-            return 1;
-        //fpu_debug();
-        fpu_update_pointers2(opcode, virtaddr, seg);
-        if (fpu_check_stack_underflow(0, 0))
-            FPU_ABORT();
-        switch (smaller_opcode >> 4 & 3) { // Extract the upper 2 bits of the small opcode
-        case 1: { // DB
-            uint32_t res;
-            if (smaller_opcode & 2)
-                res = floatx80_to_int32(fpu_get_st(0), &fpu.status);
-            else
-                res = floatx80_to_int32_round_to_zero(fpu_get_st(0), &fpu.status);
-            if (!fpu_check_exceptions2(0))
-                cpu_writel(cpu, linaddr, res); // , cpu.tlb_shift_write);
+    else {
+        switch (fpclassify(x)) {
+        case FP_NAN:
+            m->fpu.sw |= kFpuSwC0;
             break;
-        }
-        case 2: { // DD
-            uint64_t res;
-            if (smaller_opcode & 2)
-                res = floatx80_to_int64(fpu_get_st(0), &fpu.status);
-            else
-                res = floatx80_to_int64_round_to_zero(fpu_get_st(0), &fpu.status);
-            if (!fpu_check_exceptions2(0)) {
-                cpu_writel(cpu, linaddr, res); // , cpu.tlb_shift_write);
-                cpu_writel(cpu, linaddr + 4, res >> 32); // , cpu.tlb_shift_write);
-            }
+        case FP_INFINITE:
+            m->fpu.sw |= kFpuSwC0 | kFpuSwC2;
             break;
-        }
-        case 3: { // DF
-            uint16_t res;
-            if (smaller_opcode & 2)
-                res = floatx80_to_int16(fpu_get_st(0), &fpu.status);
-            else
-                res = floatx80_to_int16_round_to_zero(fpu_get_st(0), &fpu.status);
-            if (!fpu_check_exceptions2(0))
-                cpu_writew(cpu, linaddr, res); // , cpu.tlb_shift_write);
+        case FP_ZERO:
+            m->fpu.sw |= kFpuSwC3;
             break;
+        case FP_SUBNORMAL:
+            m->fpu.sw |= kFpuSwC2 | kFpuSwC3;
+            break;
+        case FP_NORMAL:
+            m->fpu.sw |= kFpuSwC2;
+            break;
+        default:
+            __builtin_unreachable();
         }
-        }
-        if (!fpu_check_exceptions2(0)) { // XXX eliminate this
-            if (smaller_opcode & 1)
-                fpu_pop();
-        }
-        fpu_commit_sw();
-        break;
     }
-    case OP(0xD9, 4): { // FLDENV - Load floating point environment from memory
-        int is16 = !cpu->isoper32; // I_OP2(i->flags); //TODO: Is this right?
-        if (fldenv(linaddr, is16))
-            FPU_ABORT();
-        break;
-    }
-    case OP(0xDB, 5): { // FLD - Load floating point register from memory
-        if (fpu_fwait())
-            return 1;
-        if (fpu_read_f80(linaddr, &temp80))
-            return 1;
-        fpu_update_pointers2(opcode, virtaddr, seg);
-        if (fpu_check_stack_overflow(-1))
-            FPU_ABORT();
-        fpu_push(temp80);
-        break;
-    }
-    case OP(0xDB, 7): { // FSTP - Store floating point register to memory and pop
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers2(opcode, virtaddr, seg);
-        if (fpu_check_stack_underflow(0, 1))
-            FPU_ABORT();
-        if (fpu_store_f80(linaddr, fpu_get_st_ptr(0)))
-            return 1;
-        fpu_pop();
-        break;
-    }
-    case OP(0xDD, 2): // FST - Store floating point register to memory
-    case OP(0xDD, 3): { // FSTP - Store floating point register to memory and pop
-        if (fpu_fwait())
-            return 1;
-        //fpu_debug();
-        fpu_update_pointers2(opcode, virtaddr, seg);
+}
 
-        if (fpu_check_stack_underflow(0, 0))
-            FPU_ABORT();
-        temp64 = floatx80_to_float64(fpu_get_st(0), &fpu.status);
-        if (!fpu_check_exceptions2(0)) {
-            if (write_float64(linaddr, temp64))
-                FPU_EXCEP();
-            fpu_commit_sw();
-            if (smaller_opcode & 1)
-                fpu_pop();
-        }
-        break;
-    }
-    case OP(0xDD, 4): { // FRSTOR -- Load FPU context
-        int is16 = !cpu->isoper32; // I_OP2(i->flags); //TODO: Is this right?
-        if (fldenv(linaddr, is16))
-            FPU_ABORT();
-        int offset = 14 << !is16;
-        for (int i = 0; i < 8; i++) {
-            if (fpu_read_f80(offset + linaddr, &fpu.st[(fpu.ftop + i) & 7]))
-                FPU_EXCEP();
-            offset += 10;
-        }
-        break;
-    }
-    case OP(0xDD, 6): { // FSAVE - Save FPU environment to memory
-        int is16 = !cpu->isoper32; // I_OP2(i->flags); //TODO: Is this right?
-        if (fstenv(linaddr, is16))
-            FPU_ABORT();
-        int offset = 14 << !is16;
-        for (int i = 0; i < 8; i++) {
-            if (fpu_store_f80(offset + linaddr, &fpu.st[(fpu.ftop + i) & 7]))
-                FPU_EXCEP();
-            offset += 10;
-        }
-        fninit();
-        break;
-    }
-    case OP(0xDD, 7): // FSTSW - Store status word to memory
-        cpu_writew(cpu, linaddr, fpu_get_status_word()); // , cpu.tlb_shift_write);
-        break;
-    case OP(0xDF, 4): { // FBLD - The infamous "load BCD" instruction. Loads BCD integer and converts to floatx80
-        uint32_t low, high, higher;
-        if (fpu_fwait())
-            return 1;
-        low = cpu_readl(cpu, linaddr); // , low, cpu.tlb_shift_read);
-        high = cpu_readl(cpu, linaddr + 4); // , high, cpu.tlb_shift_read);
-        higher = cpu_readw(cpu, linaddr + 8); // , higher, cpu.tlb_shift_read);
-        fpu_update_pointers2(opcode, virtaddr, seg);
+static void OpFtst(struct Machine* m) {
+    FpuCompare(m, 0);
+}
 
-        uint64_t result = 0;
-        int sign = higher & 0x8000;
-        higher &= 0x7FFF;
-        // XXX - use only one loop
-        for (int i = 0; i < 4; i++) {
-            result *= 100;
-            uint8_t temp = low & 0xFF;
-            result += temp - (6 * (temp >> 4));
-            low >>= 8;
-        }
-        for (int i = 0; i < 4; i++) {
-            result *= 100;
-            uint8_t temp = high & 0xFF;
-            result += temp - (6 * (temp >> 4));
-            high >>= 8;
-        }
-        for (int i = 0; i < 2; i++) {
-            result *= 100;
-            uint8_t temp = higher & 0xFF;
-            result += temp - (6 * (temp >> 4));
-            higher >>= 8;
-        }
-        temp80 = int64_to_floatx80((uint64_t)sign << (64LL - 16LL) | result);
-        if (fpu_check_push())
-            FPU_ABORT();
-        fpu_push(temp80);
-        break;
+static void OpFcmovb(struct Machine* m, u64 rde) {
+    //if (GetFlag(m->flags, FLAGS_CF)) {
+    if (m->cpu->cf) {
+        FpuSetSt0(m, StRm(m, rde));
     }
-    case OP(0xDF, 5): { // FILD - Load floating point register.
-        uint32_t hi, low;
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers2(opcode, virtaddr, seg);
+}
 
-        low = cpu_readl(cpu, linaddr); // , low, cpu.tlb_shift_read);
-        hi = cpu_readl(cpu, linaddr + 4); // , hi, cpu.tlb_shift_read);
-        temp80 = int64_to_floatx80((uint64_t)low | (uint64_t)hi << 32);
-        if (fpu_check_push())
-            FPU_ABORT();
-        fpu_push(temp80);
-        break;
+static void OpFcmove(struct Machine* m, u64 rde) {
+    //if (GetFlag(m->flags, FLAGS_ZF)) {
+    if (m->cpu->zf) {
+        FpuSetSt0(m, StRm(m, rde));
     }
-    case OP(0xDF, 6): { // FBSTP - Store BCD to memory
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers2(opcode, virtaddr, seg);
-        floatx80 st0 = fpu_get_st(0);
-        uint64_t bcd = floatx80_to_int64(st0, &fpu.status);
+}
 
-        if (fpu_check_exceptions())
-            FPU_ABORT();
-        // Make sure we didn't cause exception
+static void OpFcmovbe(struct Machine* m, u64 rde) {
+    //if (GetFlag(m->flags, FLAGS_CF) || GetFlag(m->flags, FLAGS_ZF)) {
+    if (m->cpu->cf || m->cpu->zf) {
+        FpuSetSt0(m, StRm(m, rde));
+    }
+}
 
-        for (int i = 0; i < 9; i++) {
-            int result = bcd % 10;
-            bcd /= 10;
-            result |= (bcd % 10) << 4;
-            bcd /= 10;
-            cpu_write(cpu, linaddr + i, result); // , cpu.tlb_shift_write);
-        }
+static void OpFcmovu(struct Machine* m, u64 rde) {
+    //if (GetFlag(m->flags, FLAGS_PF)) {
+    if (m->cpu->pf) {
+        FpuSetSt0(m, StRm(m, rde));
+    }
+}
 
-        int result = bcd % 10;
-        bcd /= 10;
-        result |= (bcd % 10) << 4;
-        cpu_write(cpu, linaddr + 9, result | (st0.exp >> 8 & 0x80)); // , cpu.tlb_shift_write);
+static void OpFcmovnb(struct Machine* m, u64 rde) {
+    //if (!GetFlag(m->flags, FLAGS_CF)) {
+    if (!m->cpu->cf) {
+        FpuSetSt0(m, StRm(m, rde));
+    }
+}
 
-        fpu_pop();
-        break;
+static void OpFcmovne(struct Machine* m, u64 rde) {
+    //if (!GetFlag(m->flags, FLAGS_ZF)) {
+    if (!m->cpu->zf) {
+        FpuSetSt0(m, StRm(m, rde));
     }
-    case OP(0xDF, 7): { // FISTP - Store floating point register to integer and pop
-        if (fpu_fwait())
-            return 1;
-        fpu_update_pointers2(opcode, virtaddr, seg);
-        if (fpu_check_stack_underflow(0, 0))
-            FPU_ABORT();
-        uint64_t i64 = floatx80_to_int64(fpu_get_st(0), &fpu.status);
-        if (fpu_check_exceptions2(0))
-            FPU_ABORT();
-        cpu_writel(cpu, linaddr, (uint32_t)i64); // , cpu.tlb_shift_write);
-        cpu_writel(cpu, linaddr + 4, (uint32_t)(i64 >> 32)); // , cpu.tlb_shift_write);
-        fpu_commit_sw();
-        fpu_pop();
-        break;
+}
+
+static void OpFcmovnbe(struct Machine* m, u64 rde) {
+    //if (!(GetFlag(m->flags, FLAGS_CF) || GetFlag(m->flags, FLAGS_ZF))) {
+    if (!m->cpu->cf || m->cpu->zf) {
+        FpuSetSt0(m, StRm(m, rde));
     }
-    case OP(0xD9, 1):
-    case OP(0xDB, 4):
-    case OP(0xDB, 6):
-    case OP(0xDD, 5): {
-        int major_opcode = opcode >> 8 | 0xD8;
-        UNUSED(major_opcode);
-        //CPU_LOG("Unknown FPU memory operation: %02x %02x [%02x /%d] internal=%d\n", major_opcode, opcode & 0xFF, major_opcode, opcode >> 3 & 7, (opcode >> 5 & 0x38) | (opcode >> 3 & 7));
-        break;
+}
+
+static void OpFcmovnu(struct Machine* m, u64 rde) {
+    //if (!GetFlag(m->flags, FLAGS_PF)) {
+    if (!m->cpu->pf) {
+        FpuSetSt0(m, StRm(m, rde));
     }
-    default: {
-        int major_opcode = opcode >> 8 | 0xD8;
-        //CPU_FATAL("Unknown FPU memory operation: %02x %02x [%02x /%d] internal=%d\n", major_opcode, opcode & 0xFF, major_opcode, opcode >> 3 & 7, (opcode >> 5 & 0x38) | (opcode >> 3 & 7));
-    }
-    }
-    fpu_watchpoint2();
+}
+
+static void OpFchs(struct Machine* m) {
+    FpuSetSt0(m, -St0(m));
+}
+
+static void OpFabs(struct Machine* m) {
+    FpuSetSt0(m, fabs(St0(m)));
+}
+
+static void OpF2xm1(struct Machine* m) {
+    FpuSetSt0(m, f2xm1(St0(m)));
+}
+
+static void OpFyl2x(struct Machine* m) {
+    FpuSetStPop(m, 1, fyl2x(St0(m), St1(m)));
+}
+
+static void OpFyl2xp1(struct Machine* m) {
+    FpuSetStPop(m, 1, fyl2xp1(St0(m), St1(m)));
+}
+
+static void OpFcos(struct Machine* m) {
+    FpuClearOutOfRangeIndicator(m);
+    FpuSetSt0(m, cos(St0(m)));
+}
+
+static void OpFsin(struct Machine* m) {
+    FpuClearOutOfRangeIndicator(m);
+    FpuSetSt0(m, sin(St0(m)));
+}
+
+static void OpFptan(struct Machine* m) {
+    FpuClearOutOfRangeIndicator(m);
+    FpuSetSt0(m, tan(St0(m)));
+    FpuPush(m, 1);
+}
+
+static void OpFsincos(struct Machine* m) {
+    double tsin, tcos;
+    FpuClearOutOfRangeIndicator(m);
+    tsin = sin(St0(m));
+    tcos = cos(St0(m));
+    FpuSetSt0(m, tsin);
+    FpuPush(m, tcos);
+}
+
+static void OpFpatan(struct Machine* m) {
+    FpuClearRoundup(m);
+    FpuSetStPop(m, 1, atan2(St1(m), St0(m)));
+}
+
+static void OpFcom(struct Machine* m, u64 rde) {
+    FpuCompare(m, StRm(m, rde));
+}
+
+static void OpFcomp(struct Machine* m, u64 rde) {
+    FpuCompare(m, StRm(m, rde));
+    FpuPop(m);
+}
+
+static void OpFaddStEst(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuAdd(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFmulStEst(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuMul(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFsubStEst(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuSub(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFsubrStEst(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuSub(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFdivStEst(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuDiv(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFdivrStEst(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuDiv(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFaddEstSt(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, FpuAdd(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFmulEstSt(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, FpuMul(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFsubEstSt(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, FpuSub(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFsubrEstSt(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, FpuSub(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFdivEstSt(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, FpuDiv(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFdivrEstSt(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, FpuDiv(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFaddp(struct Machine* m, u64 rde) {
+    FpuSetStRmPop(m, rde, FpuAdd(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFmulp(struct Machine* m, u64 rde) {
+    FpuSetStRmPop(m, rde, FpuMul(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFcompp(struct Machine* m, u64 rde) {
+    OpFcomp(m, rde);
+    FpuPop(m);
+}
+
+static void OpFsubp(struct Machine* m, u64 rde) {
+    FpuSetStRmPop(m, rde, FpuSub(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFsubrp(struct Machine* m, u64 rde) {
+    FpuSetStPop(m, 1, FpuSub(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFdivp(struct Machine* m, u64 rde) {
+    FpuSetStRmPop(m, rde, FpuDiv(m, St0(m), StRm(m, rde)));
+}
+
+static void OpFdivrp(struct Machine* m, u64 rde) {
+    FpuSetStRmPop(m, rde, FpuDiv(m, StRm(m, rde), St0(m)));
+}
+
+static void OpFadds(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuAdd(m, St0(m), FpuGetMemoryFloat(m)));
+}
+
+static void OpFmuls(struct Machine* m, u64 rde) {
+    FpuSetSt0(m, FpuMul(m, St0(m), FpuGetMemoryFloat(m)));
+}
+
+static void OpFcoms(struct Machine* m) {
+    FpuCompare(m, FpuGetMemoryFloat(m));
+}
+
+static void OpFcomps(struct Machine* m) {
+    OpFcoms(m);
+    FpuPop(m);
+}
+
+static void OpFsubs(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, St0(m), FpuGetMemoryFloat(m)));
+}
+
+static void OpFsubrs(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, FpuGetMemoryFloat(m), St0(m)));
+}
+
+static void OpFdivs(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, St0(m), FpuGetMemoryFloat(m)));
+}
+
+static void OpFdivrs(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, FpuGetMemoryFloat(m), St0(m)));
+}
+
+static void OpFaddl(struct Machine* m) {
+    FpuSetSt0(m, FpuAdd(m, St0(m), FpuGetMemoryDouble(m)));
+}
+
+static void OpFmull(struct Machine* m) {
+    FpuSetSt0(m, FpuMul(m, St0(m), FpuGetMemoryDouble(m)));
+}
+
+static void OpFcoml(struct Machine* m) {
+    FpuCompare(m, FpuGetMemoryDouble(m));
+}
+
+static void OpFcompl(struct Machine* m) {
+    FpuCompare(m, FpuGetMemoryDouble(m));
+    FpuPop(m);
+}
+
+static void OpFsubl(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, St0(m), FpuGetMemoryDouble(m)));
+}
+
+static void OpFsubrl(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, FpuGetMemoryDouble(m), St0(m)));
+}
+
+static void OpFdivl(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, St0(m), FpuGetMemoryDouble(m)));
+}
+
+static void OpFdivrl(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, FpuGetMemoryDouble(m), St0(m)));
+}
+
+static void OpFiaddl(struct Machine* m) {
+    FpuSetSt0(m, FpuAdd(m, St0(m), FpuGetMemoryInt(m)));
+}
+
+static void OpFimull(struct Machine* m) {
+    FpuSetSt0(m, FpuMul(m, St0(m), FpuGetMemoryInt(m)));
+}
+
+static void OpFicoml(struct Machine* m) {
+    FpuCompare(m, FpuGetMemoryInt(m));
+}
+
+static void OpFicompl(struct Machine* m) {
+    OpFicoml(m);
+    FpuPop(m);
+}
+
+static void OpFisubl(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, St0(m), FpuGetMemoryInt(m)));
+}
+
+static void OpFisubrl(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, FpuGetMemoryInt(m), St0(m)));
+}
+
+static void OpFidivl(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, St0(m), FpuGetMemoryInt(m)));
+}
+
+static void OpFidivrl(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, FpuGetMemoryInt(m), St0(m)));
+}
+
+static void OpFiadds(struct Machine* m) {
+    FpuSetSt0(m, FpuAdd(m, St0(m), FpuGetMemoryShort(m)));
+}
+
+static void OpFimuls(struct Machine* m) {
+    FpuSetSt0(m, FpuMul(m, St0(m), FpuGetMemoryShort(m)));
+}
+
+static void OpFicoms(struct Machine* m) {
+    FpuCompare(m, FpuGetMemoryShort(m));
+}
+
+static void OpFicomps(struct Machine* m) {
+    OpFicoms(m);
+    FpuPop(m);
+}
+
+static void OpFisubs(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, St0(m), FpuGetMemoryShort(m)));
+}
+
+static void OpFisubrs(struct Machine* m) {
+    FpuSetSt0(m, FpuSub(m, FpuGetMemoryShort(m), St0(m)));
+}
+
+static void OpFidivs(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, St0(m), FpuGetMemoryShort(m)));
+}
+
+static void OpFidivrs(struct Machine* m) {
+    FpuSetSt0(m, FpuDiv(m, FpuGetMemoryShort(m), St0(m)));
+}
+
+static void OpFsqrt(struct Machine* m) {
+    FpuClearRoundup(m);
+    FpuSetSt0(m, sqrt(St0(m)));
+}
+
+static void OpFrndint(struct Machine* m) {
+    FpuSetSt0(m, FpuRound(m, St0(m)));
+}
+
+static void OpFscale(struct Machine* m) {
+    FpuClearRoundup(m);
+    FpuSetSt0(m, fscale(St0(m), St1(m)));
+}
+
+static void OpFprem(struct Machine* m) {
+    FpuSetSt0(m, fprem(St0(m), St1(m), &m->fpu.sw));
+}
+
+static void OpFprem1(struct Machine* m) {
+    FpuSetSt0(m, fprem1(St0(m), St1(m), &m->fpu.sw));
+}
+
+static void OpFdecstp(struct Machine* m) {
+    m->fpu.sw = (m->fpu.sw & ~kFpuSwSp) | ((m->fpu.sw - (1 << 11)) & kFpuSwSp);
+}
+
+static void OpFincstp(struct Machine* m) {
+    m->fpu.sw = (m->fpu.sw & ~kFpuSwSp) | ((m->fpu.sw + (1 << 11)) & kFpuSwSp);
+}
+
+static void OpFxtract(struct Machine* m) {
+    double x = St0(m);
+    FpuSetSt0(m, logb(x));
+    FpuPush(m, ldexp(x, -ilogb(x)));
+}
+
+static void OpFld(struct Machine* m, u64 rde) {
+    FpuPush(m, StRm(m, rde));
+}
+
+static void OpFlds(struct Machine* m) {
+    FpuPush(m, FpuGetMemoryFloat(m));
+}
+
+static void OpFsts(struct Machine* m) {
+    FpuSetMemoryFloat(m, St0(m));
+}
+
+static void OpFstps(struct Machine* m) {
+    OpFsts(m);
+    FpuPop(m);
+}
+
+static void OpFstpt(struct Machine* m) {
+    FpuSetMemoryLdbl(m, FpuPop(m));
+}
+
+static void OpFstl(struct Machine* m) {
+    FpuSetMemoryDouble(m, St0(m));
+}
+
+static void OpFstpl(struct Machine* m) {
+    OpFstl(m);
+    FpuPop(m);
+}
+
+static void OpFst(struct Machine* m, u64 rde) {
+    FpuSetStRm(m, rde, St0(m));
+}
+
+static void OpFstp(struct Machine* m, u64 rde) {
+    FpuSetStRmPop(m, rde, St0(m));
+}
+
+static void OpFxch(struct Machine* m, u64 rde) {
+    double t = StRm(m, rde);
+    FpuSetStRm(m, rde, St0(m));
+    FpuSetSt0(m, t);
+}
+
+static void OpFldt(struct Machine* m) {
+    FpuPush(m, FpuGetMemoryLdbl(m));
+}
+
+static void OpFldl(struct Machine* m) {
+    FpuPush(m, FpuGetMemoryDouble(m));
+}
+
+static double Fld1(void) {
+    return 1;
+}
+
+static double Fldl2t(void) {
+    return 0xd.49a784bcd1b8afep-2L; /* log₂10 */
+}
+
+static double Fldl2e(void) {
+    return 0xb.8aa3b295c17f0bcp-3L; /* log₂𝑒 */
+}
+
+static double Fldpi(void) {
+    return 0x1.921fb54442d1846ap+1L; /* π */
+}
+
+static double Fldlg2(void) {
+    return 0x9.a209a84fbcff799p-5L; /* log₁₀2 */
+}
+
+static double Fldln2(void) {
+    return 0xb.17217f7d1cf79acp-4L; /* logₑ2 */
+}
+
+static double Fldz(void) {
     return 0;
 }
 
-#define MXCSR_MASK 0xFFFF
-// FXSAVE -- save floating point state
-int fpu_fxsave(uint32_t linaddr)
-{
-    //if (linaddr & 15)
-        //EXCEPTION_GP(0); /TODO
-    if (fpu_nm_check())
-        return 1;
-
-    //if (cpu_access_verify(linaddr, linaddr + 288 - 1, cpu.tlb_shift_write))
-    //    return 1;
-    cpu_writew(cpu, linaddr + 0, fpu.control_word); // , cpu.tlb_shift_write);
-    cpu_writew(cpu, linaddr + 2, fpu_get_status_word()); // , cpu.tlb_shift_write);
-    // "Abridge" tag word
-    uint8_t tag = 0;
-    for (int i = 0; i < 8; i++)
-        if ((fpu.tag_word >> (i * 2) & 3) != FPU_TAG_EMPTY)
-            tag |= 1 << i;
-
-    // Some fields are less than 16 or 32 bits wide, but we write them anyways.
-    // They are filled with zeros.
-    cpu_writew(cpu, linaddr + 4, tag); // , cpu.tlb_shift_write);
-    cpu_writew(cpu, linaddr + 6, fpu.fpu_opcode); // , cpu.tlb_shift_write);
-    cpu_writel(cpu, linaddr + 8, fpu.fpu_eip); // , cpu.tlb_shift_write);
-    cpu_writel(cpu, linaddr + 12, fpu.fpu_cs); // , cpu.tlb_shift_write);
-    cpu_writel(cpu, linaddr + 16, fpu.fpu_data_ptr); // , cpu.tlb_shift_write);
-    cpu_writel(cpu, linaddr + 20, fpu.fpu_data_seg); // , cpu.tlb_shift_write);
-    //TODO: The below 2 writes are apparently for SSE stuff?
-    cpu_writel(cpu, linaddr + 24, 0); // cpu.mxcsr); // , cpu.tlb_shift_write);
-    cpu_writel(cpu,linaddr + 28, 0); // MXCSR_MASK); // , cpu.tlb_shift_write);
-    uint32_t tempaddr = linaddr + 32;
-    for (int i = 0; i < 8; i++) {
-        fpu_store_f80(tempaddr, fpu_get_st_ptr(i));
-        // Fill other bytes with zeros
-        cpu_writew(cpu, tempaddr + 10, 0); // , cpu.tlb_shift_write);
-        cpu_writel(cpu, tempaddr + 12, 0); // , cpu.tlb_shift_write);
-        tempaddr += 16;
+static void OpFldConstant(struct Machine* m, u64 rde) {
+    double x;
+    switch (ModrmRm(rde)) {
+        CASE(0, x = Fld1());
+        CASE(1, x = Fldl2t());
+        CASE(2, x = Fldl2e());
+        CASE(3, x = Fldpi());
+        CASE(4, x = Fldlg2());
+        CASE(5, x = Fldln2());
+        CASE(6, x = Fldz());
+    default:
+        OpUdImpl(m);
     }
-
-    // TODO: Find out what happens on real hardware when OSFXSR isn't set.
-    tempaddr = linaddr + 160;
-    for (int i = 0; i < 8; i++) {
-        cpu_writel(cpu, tempaddr, 0); // cpu.xmm32[(i * 4)], cpu.tlb_shift_write);
-        cpu_writel(cpu, tempaddr + 4, 0); // cpu.xmm32[(i * 4) + 1], cpu.tlb_shift_write);
-        cpu_writel(cpu, tempaddr + 8, 0); // cpu.xmm32[(i * 4) + 2], cpu.tlb_shift_write);
-        cpu_writel(cpu, tempaddr + 12, 0); // cpu.xmm32[(i * 4) + 3], cpu.tlb_shift_write);
-        tempaddr += 16;
-    }
-    return 0;
-}
-// FXRSTOR -- restore floating point state
-int fpu_fxrstor(uint32_t linaddr)
-{
-    //if (linaddr & 15)
-        //EXCEPTION_GP(0); //TODO
-    if (fpu_nm_check())
-        return 1;
-    //if (cpu_access_verify(linaddr, linaddr + 288 - 1, cpu.tlb_shift_read))
-    //    return 1;
-
-    /*uint32_t mxcsr;
-    cpu_read32(linaddr + 24, mxcsr, cpu.tlb_shift_read);
-    if (mxcsr & ~MXCSR_MASK)
-        EXCEPTION_GP(0);
-    cpu.mxcsr = mxcsr;
-    cpu_update_mxcsr();*/
-
-    uint32_t temp = 0;
-    temp = cpu_readw(cpu, linaddr + 0); // , temp, cpu.tlb_shift_read);
-    fpu_set_control_word(temp);
-    temp = cpu_readw(cpu, linaddr + 2); // , temp, cpu.tlb_shift_read);
-    fpu.status_word = temp;
-    fpu.ftop = fpu.status_word >> 11 & 7;
-    fpu.status_word &= ~(7 << 11);
-
-    uint8_t small_tag_word;
-    small_tag_word = cpu_read(cpu, linaddr + 4); // , small_tag_word, cpu.tlb_shift_read);
-
-    fpu.fpu_opcode = cpu_readw(cpu, linaddr + 6); // , fpu.fpu_opcode, cpu.tlb_shift_read);
-    fpu.fpu_opcode &= 0x7FF;
-    fpu.fpu_eip = cpu_readl(cpu, linaddr + 8); // , fpu.fpu_eip, cpu.tlb_shift_read);
-    fpu.fpu_cs = cpu_readw(cpu, linaddr + 12); // , fpu.fpu_cs, cpu.tlb_shift_read); // Note: 16-bit with 4 byte gap
-    fpu.fpu_data_ptr = cpu_readl(cpu, linaddr + 16); // , fpu.fpu_data_ptr, cpu.tlb_shift_read);
-    fpu.fpu_data_seg = cpu_readw(cpu, linaddr + 20); // , fpu.fpu_data_seg, cpu.tlb_shift_read); // Note: 16-bit with 4 byte gap
-    uint32_t tempaddr = linaddr + 32;
-    /*for (int i = 0; i < 8; i++) {
-        if (fpu_read_f80(tempaddr, fpu_get_st_ptr(i)))
-            return 1;
-        tempaddr += 16;
-    }*/ //TODO: Do I need this?
-
-    // TODO: Find out what happens on real hardware when OSFXSR isn't set.
-    tempaddr = linaddr + 160;
-    for (int i = 0; i < 8; i++) {
-        /*cpu_read32(tempaddr, cpu.xmm32[(i * 4)], cpu.tlb_shift_read);
-        cpu_read32(tempaddr + 4, cpu.xmm32[(i * 4) + 1], cpu.tlb_shift_read);
-        cpu_read32(tempaddr + 8, cpu.xmm32[(i * 4) + 2], cpu.tlb_shift_read);
-        cpu_read32(tempaddr + 12, cpu.xmm32[(i * 4) + 3], cpu.tlb_shift_read);*/
-        tempaddr += 16;
-    }
-
-    // Now find out tag word
-    uint16_t tag_word = 0;
-    for (int i = 0; i < 8; i++) {
-        int tagid = FPU_TAG_EMPTY;
-        if (small_tag_word & (1 << i))
-            tagid = fpu_get_tag_from_value(&fpu.st[i]);
-        tag_word |= tagid << (i * 2);
-    }
-    //printf("new tag word: %04x small: %02x\n", tag_word, small_tag_word);
-    fpu.tag_word = tag_word;
-    return 0;
+    FpuPush(m, x);
 }
 
-int fpu_fwait(void)
-{
-    // Now is as good of a time as any to call FPU exceptions
-    if (fpu.status_word & 0x80) {
-        if (cpu->cr[0] & CR0_NE) {
-            //EXCEPTION_MF();
-        } 
-        else {
-            // yucky, but works. OS/2 uses this method
-            //pic_lower_irq(13);
-            //pic_raise_irq(13);
-            ////ABORT();
+static void OpFilds(struct Machine* m) {
+    FpuPush(m, FpuGetMemoryShort(m));
+}
+
+static void OpFildl(struct Machine* m) {
+    FpuPush(m, FpuGetMemoryInt(m));
+}
+
+static void OpFildll(struct Machine* m) {
+    FpuPush(m, FpuGetMemoryLong(m));
+}
+
+static void OpFisttpl(struct Machine* m) {
+    FpuSetMemoryInt(m, FpuPop(m));
+}
+
+static void OpFisttpll(struct Machine* m) {
+    FpuSetMemoryLong(m, FpuPop(m));
+}
+
+static void OpFisttps(struct Machine* m) {
+    FpuSetMemoryShort(m, FpuPop(m));
+}
+
+static void OpFists(struct Machine* m) {
+    FpuSetMemoryShort(m, FpuRound(m, St0(m)));
+}
+
+static void OpFistl(struct Machine* m) {
+    FpuSetMemoryInt(m, FpuRound(m, St0(m)));
+}
+
+static void OpFistll(struct Machine* m) {
+    FpuSetMemoryLong(m, FpuRound(m, St0(m)));
+}
+
+static void OpFistpl(struct Machine* m) {
+    OpFistl(m);
+    FpuPop(m);
+}
+
+static void OpFistpll(struct Machine* m) {
+    OpFistll(m);
+    FpuPop(m);
+}
+
+static void OpFistps(struct Machine* m) {
+    OpFists(m);
+    FpuPop(m);
+}
+
+static void OpFcomi(struct Machine* m, u64 rde) {
+    double x, y;
+    x = St0(m);
+    y = StRm(m, rde);
+    if (!isunordered(x, y)) {
+        //m->flags = SetFlag(m->flags, FLAGS_ZF, x == y);
+        //m->flags = SetFlag(m->flags, FLAGS_CF, x < y);
+        //m->flags = SetFlag(m->flags, FLAGS_PF, false);
+        m->cpu->zf = (x == y) ? 1 : 0;
+        m->cpu->cf = (x < y) ? 1 : 0;
+        m->cpu->pf = 0;
+    }
+    else {
+        m->fpu.sw |= kFpuSwIe;
+        //m->flags = SetFlag(m->flags, FLAGS_ZF, true);
+        //m->flags = SetFlag(m->flags, FLAGS_CF, true);
+        //m->flags = SetFlag(m->flags, FLAGS_PF, true);
+        m->cpu->zf = 1;
+        m->cpu->cf = 1;
+        m->cpu->pf = 1;
+    }
+}
+
+static void OpFucom(struct Machine* m, u64 rde) {
+    FpuCompare(m, StRm(m, rde));
+}
+
+static void OpFucomp(struct Machine* m, u64 rde) {
+    FpuCompare(m, StRm(m, rde));
+    FpuPop(m);
+}
+
+static void OpFcomip(struct Machine* m, u64 rde) {
+    OpFcomi(m, rde);
+    FpuPop(m);
+}
+
+static void OpFucomi(struct Machine* m, u64 rde) {
+    OpFcomi(m, rde);
+}
+
+static void OpFucomip(struct Machine* m, u64 rde) {
+    OpFcomip(m, rde);
+}
+
+static void OpFfree(struct Machine* m, u64 rde) {
+    FpuSetTag(m, ModrmRm(rde), kFpuTagEmpty);
+}
+
+static void OpFfreep(struct Machine* m, u64 rde) {
+    if (ModrmRm(rde)) OpFfree(m, rde);
+    FpuPop(m);
+}
+
+static void OpFstswMw(struct Machine* m) {
+    FpuSetMemoryShort(m, m->fpu.sw);
+}
+
+static void OpFstswAx(struct Machine* m) {
+    //Write16(m->ax, m->fpu.sw);
+    m->cpu->regs.wordregs[regax] = m->fpu.sw;
+}
+
+static void SetFpuEnv(struct Machine* m, u8 p[28]) {
+    *(u16*)(p + 0) = m->fpu.cw;
+    *(u16*)(p + 4) = m->fpu.sw;
+    *(u16*)(p + 8) = m->fpu.tw;
+    *(u64*)(p + 12) = m->fpu.ip;
+    *(u16*)(p + 18) = m->fpu.op;
+    *(u64*)(p + 20) = m->fpu.dp;
+}
+
+static void GetFpuEnv(struct Machine* m, u8 p[28]) {
+    m->fpu.cw = *(u16*)(p + 0);
+    m->fpu.sw = *(u16*)(p + 4);
+    m->fpu.tw = *(u16*)(p + 8);
+}
+
+static void OpFstenv(struct Machine* m) {
+    void* p[2];
+    u8 b[28];
+    SetFpuEnv(m, b); // BeginStore(m, m->fpu.dp, sizeof(b), p, b));
+    //EndStore(m, m->fpu.dp, sizeof(b), p, b);
+}
+
+static void OpFldenv(struct Machine* m) {
+    u8 b[28];
+    GetFpuEnv(m, b); //Load(m, m->fpu.dp, sizeof(b), b));
+}
+
+static void OpFsave(struct Machine* m) {
+    int i;
+    void* p[2];
+    u8* a, b[108], t[16];
+    a = b; // BeginStore(m, m->fpu.dp, sizeof(b), p, b);
+    SetFpuEnv(m, a);
+    memset(t, 0, sizeof(t));
+    for (i = 0; i < 8; ++i) {
+        SerializeLdbl(a + 28 + i * 10, *FpuSt(m, i));
+    }
+    //EndStore(m, m->fpu.dp, sizeof(b), p, b);
+    OpFinit(m);
+}
+
+static void OpFrstor(struct Machine* m) {
+    int i;
+    u8* a, b[108];
+    a = b; // Load(m, m->fpu.dp, sizeof(b), b);
+    GetFpuEnv(m, a);
+    for (i = 0; i < 8; ++i) {
+        *FpuSt(m, i) = DeserializeLdbl(a + 28 + i * 10);
+    }
+}
+
+static void OpFnclex(struct Machine* m) {
+    m->fpu.sw &= ~(kFpuSwIe | kFpuSwDe | kFpuSwZe | kFpuSwOe | kFpuSwUe |
+        kFpuSwPe | kFpuSwEs | kFpuSwSf | kFpuSwBf);
+}
+
+static void OpFnop(struct Machine* m) {
+    /* do nothing */
+}
+
+void OpFinit(struct Machine* m) {
+    m->fpu.cw = 0x037f;
+    m->fpu.sw = 0;
+    m->fpu.tw = -1;
+}
+
+void OpFwait(P) {
+    int sw, cw;
+    sw = m->fpu.sw;
+    cw = m->fpu.cw;
+    if (((sw & kFpuSwIe) && !(cw & kFpuCwIm)) ||
+        ((sw & kFpuSwDe) && !(cw & kFpuCwDm)) ||
+        ((sw & kFpuSwZe) && !(cw & kFpuCwZm)) ||
+        ((sw & kFpuSwOe) && !(cw & kFpuCwOm)) ||
+        ((sw & kFpuSwUe) && !(cw & kFpuCwUm)) ||
+        ((sw & kFpuSwPe) && !(cw & kFpuCwPm)) ||
+        ((sw & kFpuSwSf) && !(cw & kFpuCwIm))) {
+        //HaltMachine(m, kMachineFpuException); //TODO
+    }
+}
+
+int FpuGetTag(struct Machine* m, unsigned i) {
+    unsigned t;
+    t = m->fpu.tw;
+    i += (m->fpu.sw & kFpuSwSp) >> 11;
+    i &= 7;
+    i *= 2;
+    t &= 3 << i;
+    t >>= i;
+    return t;
+}
+
+void FpuSetTag(struct Machine* m, unsigned i, unsigned t) {
+    i += (m->fpu.sw & kFpuSwSp) >> 11;
+    t &= 3;
+    i &= 7;
+    i *= 2;
+    m->fpu.tw &= ~(3 << i);
+    m->fpu.tw |= t << i;
+}
+
+void FpuPush(struct Machine* m, double x) {
+    if (FpuGetTag(m, -1) != kFpuTagEmpty) OnFpuStackOverflow(m);
+    m->fpu.sw = (m->fpu.sw & ~kFpuSwSp) | ((m->fpu.sw - (1 << 11)) & kFpuSwSp);
+    *FpuSt(m, 0) = x;
+    FpuSetTag(m, 0, kFpuTagValid);
+}
+
+double FpuPop(struct Machine* m) {
+    double x;
+    if (FpuGetTag(m, 0) != kFpuTagEmpty) {
+        x = *FpuSt(m, 0);
+        FpuSetTag(m, 0, kFpuTagEmpty);
+    }
+    else {
+        x = OnFpuStackUnderflow(m);
+    }
+    m->fpu.sw = (m->fpu.sw & ~kFpuSwSp) | ((m->fpu.sw + (1 << 11)) & kFpuSwSp);
+    return x;
+}
+
+void OpFpu() { //P) {
+    unsigned op;
+    u64 rde = 0; //unused
+    struct Machine* m = &fpum;
+    bool ismemory;
+    //printf("FPU op %02X\n", m->cpu->opcode);
+    op = m->cpu->opcode & 7; //Opcode(rde) & 7;
+    m->fpu.ip = m->cpu->ip - 1;
+    modregrm(m->cpu);
+    ismemory = m->cpu->mode != 3;
+    m->fpu.op = op << 8 | m->cpu->mode << 6 | m->cpu->reg << 3 | m->cpu->rm;
+    //m->fpu.dp = ismemory ? ComputeAddress(A) : 0;
+    if (ismemory) {
+        getea(m->cpu, m->cpu->rm);
+        m->fpu.dp = m->cpu->ea;
+    }
+    else {
+        m->fpu.dp = 0;
+    }
+    switch (DISP(op, ismemory, ModrmReg(rde))) {
+        CASE(DISP(0xD8, FPUREG, 0), OpFaddStEst(m, rde));
+        CASE(DISP(0xD8, FPUREG, 1), OpFmulStEst(m, rde));
+        CASE(DISP(0xD8, FPUREG, 2), OpFcom(m, rde));
+        CASE(DISP(0xD8, FPUREG, 3), OpFcomp(m, rde));
+        CASE(DISP(0xD8, FPUREG, 4), OpFsubStEst(m, rde));
+        CASE(DISP(0xD8, FPUREG, 5), OpFsubrStEst(m, rde));
+        CASE(DISP(0xD8, FPUREG, 6), OpFdivStEst(m, rde));
+        CASE(DISP(0xD8, FPUREG, 7), OpFdivrStEst(m, rde));
+        CASE(DISP(0xD8, MEMORY, 0), OpFadds(m, rde));
+        CASE(DISP(0xD8, MEMORY, 1), OpFmuls(m, rde));
+        CASE(DISP(0xD8, MEMORY, 2), OpFcoms(m));
+        CASE(DISP(0xD8, MEMORY, 3), OpFcomps(m));
+        CASE(DISP(0xD8, MEMORY, 4), OpFsubs(m));
+        CASE(DISP(0xD8, MEMORY, 5), OpFsubrs(m));
+        CASE(DISP(0xD8, MEMORY, 6), OpFdivs(m));
+        CASE(DISP(0xD8, MEMORY, 7), OpFdivrs(m));
+        CASE(DISP(0xD9, FPUREG, 0), OpFld(m, rde));
+        CASE(DISP(0xD9, FPUREG, 1), OpFxch(m, rde));
+        CASE(DISP(0xD9, FPUREG, 2), OpFnop(m));
+        CASE(DISP(0xD9, FPUREG, 3), OpFstp(m, rde));
+        CASE(DISP(0xD9, FPUREG, 5), OpFldConstant(m, rde));
+        CASE(DISP(0xD9, MEMORY, 0), OpFlds(m));
+        CASE(DISP(0xD9, MEMORY, 2), OpFsts(m));
+        CASE(DISP(0xD9, MEMORY, 3), OpFstps(m));
+        CASE(DISP(0xD9, MEMORY, 4), OpFldenv(m));
+        CASE(DISP(0xD9, MEMORY, 5), OpFldcw(m));
+        CASE(DISP(0xD9, MEMORY, 6), OpFstenv(m));
+        CASE(DISP(0xD9, MEMORY, 7), OpFstcw(m));
+        CASE(DISP(0xDA, FPUREG, 0), OpFcmovb(m, rde));
+        CASE(DISP(0xDA, FPUREG, 1), OpFcmove(m, rde));
+        CASE(DISP(0xDA, FPUREG, 2), OpFcmovbe(m, rde));
+        CASE(DISP(0xDA, FPUREG, 3), OpFcmovu(m, rde));
+        CASE(DISP(0xDA, MEMORY, 0), OpFiaddl(m));
+        CASE(DISP(0xDA, MEMORY, 1), OpFimull(m));
+        CASE(DISP(0xDA, MEMORY, 2), OpFicoml(m));
+        CASE(DISP(0xDA, MEMORY, 3), OpFicompl(m));
+        CASE(DISP(0xDA, MEMORY, 4), OpFisubl(m));
+        CASE(DISP(0xDA, MEMORY, 5), OpFisubrl(m));
+        CASE(DISP(0xDA, MEMORY, 6), OpFidivl(m));
+        CASE(DISP(0xDA, MEMORY, 7), OpFidivrl(m));
+        CASE(DISP(0xDB, FPUREG, 0), OpFcmovnb(m, rde));
+        CASE(DISP(0xDB, FPUREG, 1), OpFcmovne(m, rde));
+        CASE(DISP(0xDB, FPUREG, 2), OpFcmovnbe(m, rde));
+        CASE(DISP(0xDB, FPUREG, 3), OpFcmovnu(m, rde));
+        CASE(DISP(0xDB, FPUREG, 5), OpFucomi(m, rde));
+        CASE(DISP(0xDB, FPUREG, 6), OpFcomi(m, rde));
+        CASE(DISP(0xDB, MEMORY, 0), OpFildl(m));
+        CASE(DISP(0xDB, MEMORY, 1), OpFisttpl(m));
+        CASE(DISP(0xDB, MEMORY, 2), OpFistl(m));
+        CASE(DISP(0xDB, MEMORY, 3), OpFistpl(m));
+        CASE(DISP(0xDB, MEMORY, 5), OpFldt(m));
+        CASE(DISP(0xDB, MEMORY, 7), OpFstpt(m));
+        CASE(DISP(0xDC, FPUREG, 0), OpFaddEstSt(m, rde));
+        CASE(DISP(0xDC, FPUREG, 1), OpFmulEstSt(m, rde));
+        CASE(DISP(0xDC, FPUREG, 2), OpFcom(m, rde));
+        CASE(DISP(0xDC, FPUREG, 3), OpFcomp(m, rde));
+        CASE(DISP(0xDC, FPUREG, 4), OpFsubEstSt(m, rde));
+        CASE(DISP(0xDC, FPUREG, 5), OpFsubrEstSt(m, rde));
+        CASE(DISP(0xDC, FPUREG, 6), OpFdivEstSt(m, rde));
+        CASE(DISP(0xDC, FPUREG, 7), OpFdivrEstSt(m, rde));
+        CASE(DISP(0xDC, MEMORY, 0), OpFaddl(m));
+        CASE(DISP(0xDC, MEMORY, 1), OpFmull(m));
+        CASE(DISP(0xDC, MEMORY, 2), OpFcoml(m));
+        CASE(DISP(0xDC, MEMORY, 3), OpFcompl(m));
+        CASE(DISP(0xDC, MEMORY, 4), OpFsubl(m));
+        CASE(DISP(0xDC, MEMORY, 5), OpFsubrl(m));
+        CASE(DISP(0xDC, MEMORY, 6), OpFdivl(m));
+        CASE(DISP(0xDC, MEMORY, 7), OpFdivrl(m));
+        CASE(DISP(0xDD, FPUREG, 0), OpFfree(m, rde));
+        CASE(DISP(0xDD, FPUREG, 1), OpFxch(m, rde));
+        CASE(DISP(0xDD, FPUREG, 2), OpFst(m, rde));
+        CASE(DISP(0xDD, FPUREG, 3), OpFstp(m, rde));
+        CASE(DISP(0xDD, FPUREG, 4), OpFucom(m, rde));
+        CASE(DISP(0xDD, FPUREG, 5), OpFucomp(m, rde));
+        CASE(DISP(0xDD, MEMORY, 0), OpFldl(m));
+        CASE(DISP(0xDD, MEMORY, 1), OpFisttpll(m));
+        CASE(DISP(0xDD, MEMORY, 2), OpFstl(m));
+        CASE(DISP(0xDD, MEMORY, 3), OpFstpl(m));
+        CASE(DISP(0xDD, MEMORY, 4), OpFrstor(m));
+        CASE(DISP(0xDD, MEMORY, 6), OpFsave(m));
+        CASE(DISP(0xDD, MEMORY, 7), OpFstswMw(m));
+        CASE(DISP(0xDE, FPUREG, 0), OpFaddp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 1), OpFmulp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 2), OpFcomp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 3), OpFcompp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 4), OpFsubp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 5), OpFsubrp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 6), OpFdivp(m, rde));
+        CASE(DISP(0xDE, FPUREG, 7), OpFdivrp(m, rde));
+        CASE(DISP(0xDE, MEMORY, 0), OpFiadds(m));
+        CASE(DISP(0xDE, MEMORY, 1), OpFimuls(m));
+        CASE(DISP(0xDE, MEMORY, 2), OpFicoms(m));
+        CASE(DISP(0xDE, MEMORY, 3), OpFicomps(m));
+        CASE(DISP(0xDE, MEMORY, 4), OpFisubs(m));
+        CASE(DISP(0xDE, MEMORY, 5), OpFisubrs(m));
+        CASE(DISP(0xDE, MEMORY, 6), OpFidivs(m));
+        CASE(DISP(0xDE, MEMORY, 7), OpFidivrs(m));
+        CASE(DISP(0xDF, FPUREG, 0), OpFfreep(m, rde));
+        CASE(DISP(0xDF, FPUREG, 1), OpFxch(m, rde));
+        CASE(DISP(0xDF, FPUREG, 2), OpFstp(m, rde));
+        CASE(DISP(0xDF, FPUREG, 3), OpFstp(m, rde));
+        CASE(DISP(0xDF, FPUREG, 4), OpFstswAx(m));
+        CASE(DISP(0xDF, FPUREG, 5), OpFucomip(m, rde));
+        CASE(DISP(0xDF, FPUREG, 6), OpFcomip(m, rde));
+        CASE(DISP(0xDF, MEMORY, 0), OpFilds(m));
+        CASE(DISP(0xDF, MEMORY, 1), OpFisttps(m));
+        CASE(DISP(0xDF, MEMORY, 2), OpFists(m));
+        CASE(DISP(0xDF, MEMORY, 3), OpFistps(m));
+        CASE(DISP(0xDF, MEMORY, 5), OpFildll(m));
+        CASE(DISP(0xDF, MEMORY, 7), OpFistpll(m));
+    case DISP(0xD9, FPUREG, 4):
+        switch (ModrmRm(rde)) {
+            CASE(0, OpFchs(m));
+            CASE(1, OpFabs(m));
+            CASE(4, OpFtst(m));
+            CASE(5, OpFxam(m));
+        default:
+            OpUdImpl(m);
         }
-    }
-    return 0;
-}
-
-void fpu_init(CPU_t* cpuptr)
-{
-    //state_register(fpu_state); //TODO
-    cpu = cpuptr;
-}
-
-// Utilities for debugging
-#ifdef FPU_DEBUG
-double f80_to_double(floatx80* f80)
-{
-    double scale_factor = pow(2.0, -63.0);
-    uint16_t exponent;
-    uint64_t fraction;
-    floatx80_unpack(f80, exponent, fraction);
-
-    double f = pow(2.0, ((exponent & 0x7FFF) - 0x3FFF));
-    if (exponent > 0x8000)
-        f = -f;
-    f *= fraction * scale_factor;
-    return f;
-}
-void fpu_debug(void)
-{
-    fprintf(stderr, " === FPU Context Dump ===\n");
-    fprintf(stderr, "FPU CS:EIP: %04x:%08x Data Pointer: %04x:%08x\n", fpu.fpu_cs, fpu.fpu_eip, fpu.fpu_data_seg, fpu.fpu_data_ptr);
-    int opcode = fpu.fpu_opcode >> 8 | 0xD8;
-    fprintf(stderr, "Last FPU opcode: %04x [%02x %02x | %02x /%d]\n", fpu.fpu_opcode, opcode, fpu.fpu_opcode & 0xFF, opcode, fpu.fpu_opcode >> 3 & 7);
-    fprintf(stderr, "Status: %04x (top: %d) Control: %04x Tag: %04x\n", fpu.status_word, fpu.ftop, fpu.control_word, fpu.tag_word);
-    for (int i = 0; i < 8; i++) {
-        int real_index = (i + fpu.ftop) & 7;
-        floatx80 st = fpu.st[real_index];
-        double f = f80_to_double(&st);
-
-        uint16_t exponent;
-        uint64_t fraction;
-        floatx80_unpack(&st, exponent, fraction);
-
-        uint32_t high = fraction >> 32;
-        fprintf(stderr, "ST%d(%c) [FP%d]: %04x %08x%08x (%.10f)\n", i, "v0se"[fpu_get_tag(i)], real_index, exponent, high, (uint32_t)fraction, f);
+        break;
+    case DISP(0xD9, FPUREG, 6):
+        switch (ModrmRm(rde)) {
+            CASE(0, OpF2xm1(m));
+            CASE(1, OpFyl2x(m));
+            CASE(2, OpFptan(m));
+            CASE(3, OpFpatan(m));
+            CASE(4, OpFxtract(m));
+            CASE(5, OpFprem1(m));
+            CASE(6, OpFdecstp(m));
+            CASE(7, OpFincstp(m));
+        default:
+            __builtin_unreachable();
+        }
+        break;
+    case DISP(0xD9, FPUREG, 7):
+        switch (ModrmRm(rde)) {
+            CASE(0, OpFprem(m));
+            CASE(1, OpFyl2xp1(m));
+            CASE(2, OpFsqrt(m));
+            CASE(3, OpFsincos(m));
+            CASE(4, OpFrndint(m));
+            CASE(5, OpFscale(m));
+            CASE(6, OpFsin(m));
+            CASE(7, OpFcos(m));
+        default:
+            __builtin_unreachable();
+        }
+        break;
+    case DISP(0xDb, FPUREG, 4):
+        switch (ModrmRm(rde)) {
+            CASE(2, OpFnclex(m));
+            CASE(3, OpFinit(m));
+        default:
+            OpUdImpl(m);
+        }
+        break;
+    default:
+        OpUdImpl(m);
     }
 }
 
-void printFloat80(floatx80* arg)
-{
-    uint16_t exponent;
-    uint64_t fraction;
-    floatx80_unpack(arg, exponent, fraction);
-    printf("%04x %08x%08x\n", exponent, (uint32_t)(fraction >> 32), (uint32_t)fraction);
+#else /* DISABLE_X87 */
+
+void(OpFpu)(P) {
+    unsigned op;
+    bool ismemory;
+    op = Opcode(rde) & 7;
+    ismemory = ModrmMod(rde) != 3;
+    m->fpu.dp = ismemory ? ComputeAddress(A) : 0;
+    switch (DISP(op, ismemory, ModrmReg(rde))) {
+        CASE(DISP(0xD9, MEMORY, 5), OpFldcw(m));
+        CASE(DISP(0xD9, MEMORY, 7), OpFstcw(m));
+    default:
+        OpUdImpl(m);
+    }
 }
 
-void* fpu_get_st_ptr1(void)
-{
-    return &fpu.st[0];
-}
-#endif
+#endif /* DISABLE_X87 */

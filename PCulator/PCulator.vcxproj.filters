@@ -186,17 +186,11 @@
     <ClCompile Include="..\libudis86\itab.c">
       <Filter>Source Files\libudis86</Filter>
     </ClCompile>
-    <ClCompile Include="cpu\fpu.c">
-      <Filter>Source Files\cpu</Filter>
-    </ClCompile>
     <ClCompile Include="modules\disk\ata.c">
       <Filter>Source Files\modules\disk</Filter>
     </ClCompile>
     <ClCompile Include="chipset\opti5x7.c">
       <Filter>Source Files\chipset</Filter>
-    </ClCompile>
-    <ClCompile Include="cpu\softfloat.c">
-      <Filter>Source Files\cpu</Filter>
     </ClCompile>
     <ClCompile Include="modules\video\text.c">
       <Filter>Source Files\modules\video</Filter>
@@ -206,6 +200,9 @@
     </ClCompile>
     <ClCompile Include="modules\disk\pcem-hdd_file.c">
       <Filter>Source Files\modules\disk</Filter>
+    </ClCompile>
+    <ClCompile Include="cpu\fpu.c">
+      <Filter>Source Files\cpu</Filter>
     </ClCompile>
   </ItemGroup>
   <ItemGroup>
@@ -329,9 +326,6 @@
     <ClInclude Include="modules\disk\ata.h">
       <Filter>Header Files\modules\disk</Filter>
     </ClInclude>
-    <ClInclude Include="cpu\fpu.h">
-      <Filter>Header Files\cpu</Filter>
-    </ClInclude>
     <ClInclude Include="modules\video\text.h">
       <Filter>Header Files\modules\video</Filter>
     </ClInclude>
@@ -340,6 +334,9 @@
     </ClInclude>
     <ClInclude Include="modules\disk\pcem-ide.h">
       <Filter>Header Files\modules\disk</Filter>
+    </ClInclude>
+    <ClInclude Include="cpu\fpu.h">
+      <Filter>Header Files\cpu</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

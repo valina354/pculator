@@ -185,7 +185,6 @@
     <ClCompile Include="cmosrtc.c" />
     <ClCompile Include="cpu\cpu.c" />
     <ClCompile Include="cpu\fpu.c" />
-    <ClCompile Include="cpu\softfloat.c" />
     <ClCompile Include="debuglog.c" />
     <ClCompile Include="machine.c" />
     <ClCompile Include="main.c" />

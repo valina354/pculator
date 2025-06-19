@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <string.h>
 #include "cpu.h"
+#include "fpu.h"
 #include "../config.h"
 #include "../memory.h"
 #include "../debuglog.h"
@@ -1185,7 +1186,8 @@ void cpu_reset(CPU_t* cpu) {
 	cpu->trap_toggle = 0;
 	cpu->have387 = 1;
 	cpu->cr[0] = 0x00000010 | ((cpu->have387 ^ 1) << 2);
-	fpu_init(cpu);
+	//fpu_init(cpu);
+	fpunew_init(cpu);
 }
 
 FUNC_INLINE uint16_t readrm16(CPU_t* cpu, uint8_t rmval) {
@@ -7109,14 +7111,15 @@ void op_fpu(CPU_t* cpu) {
 	//if (cpu->have387) {
 	if ((cpu->cr[0] & 4) == 0) {
 		//fpu_exec(cpu);
-		modregrm(cpu);
+		/*modregrm(cpu);
 		if (cpu->mode == 3) {
 			fpu_reg_op(NULL, 0);
 		}
 		else {
 			getea(cpu, cpu->rm);
-			fpu_mem_op(NULL, cpu->ea - cpu->useseg, cpu->currentseg);
-		}
+			fpu_mem_op(NULL, cpu->ea, cpu->currentseg);
+		}*/
+		OpFpu();
 	}
 	else {
 		StepIP(cpu, 1);
