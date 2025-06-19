@@ -4,7 +4,7 @@
 #include <stdint.h>
 
 #define STR_TITLE "PCulator"
-#define STR_VERSION "0.25.6.2"
+#define STR_VERSION "0.25.6.19"
 
 //#define DEBUG_INTS
 //#define DEBUG_DMA
