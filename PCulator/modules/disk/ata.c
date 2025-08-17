@@ -487,7 +487,7 @@ void ata_init(I8259_t* i8259) {
 	ata.i8259 = i8259;
 	ata.delay_irq = 0;
 
-	ata.timernum = timing_addTimer(ata_delayed_irq, NULL, 1500, 0);
+	ata.timernum = timing_addTimer(ata_delayed_irq, NULL, 750, 0);
 	ata.resettimer = timing_addTimer(ata_reset_cb, NULL, 4, 0);
 
 	ports_cbRegister(0x1F0, 1, ata_read_port, ata_read_data, ata_write_port, ata_write_data, NULL);

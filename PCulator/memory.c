@@ -143,7 +143,7 @@ FUNC_FORCE_INLINE uint32_t translate_page(CPU_t* cpu, uint32_t addr32, int iswri
 	uint32_t dir, table, offset, dentry_addr, dentry, tentry_addr, tentry, physical;
 	uint8_t* dptr;
 	uint8_t* tptr;
-	int map;
+	int map, eff_user;
 
 	// Split the 32-bit linear address
 	dir = (addr32 >> 22) & 0x3FF;
@@ -193,6 +193,13 @@ FUNC_FORCE_INLINE uint32_t translate_page(CPU_t* cpu, uint32_t addr32, int iswri
 		((uint32_t)tptr[2] << 16) |
 		((uint32_t)tptr[3] << 24);
 
+	/*if ((cpu->startcpl == 3) && ((dentry & 0x4) && (tentry & 0x4))) {
+		tptr[0] |= 0x40;  // PTE accessed bit
+		cpu->cr[2] = addr32;
+		exception(cpu, 14, 1 | 4 | (iswrite ? 2 : 0));
+		return 0xFFFFFFFF;
+	}*/
+
 	// Mask out the lower 12 bits (flags) to get the base address of the page
 	physical = (tentry & 0xFFFFF000) + offset;
 
@@ -223,7 +230,7 @@ FUNC_FORCE_INLINE uint32_t translate_page(CPU_t* cpu, uint32_t addr32, int iswri
 		tptr[0] |= 0x40;
 		dptr[0] |= 0x40;
 	}
-	dptr[0] |= 0x20;  // PDE accessed bit
+	//dptr[0] |= 0x20;  // PDE accessed bit
 	tptr[0] |= 0x20;  // PTE accessed bit
 
 	return physical;
