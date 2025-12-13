@@ -195,12 +195,6 @@
     <ClCompile Include="modules\video\text.c">
       <Filter>Source Files\modules\video</Filter>
     </ClCompile>
-    <ClCompile Include="modules\disk\pcem-ide.c">
-      <Filter>Source Files\modules\disk</Filter>
-    </ClCompile>
-    <ClCompile Include="modules\disk\pcem-hdd_file.c">
-      <Filter>Source Files\modules\disk</Filter>
-    </ClCompile>
     <ClCompile Include="cpu\fpu.c">
       <Filter>Source Files\cpu</Filter>
     </ClCompile>
@@ -328,12 +322,6 @@
     </ClInclude>
     <ClInclude Include="modules\video\text.h">
       <Filter>Header Files\modules\video</Filter>
-    </ClInclude>
-    <ClInclude Include="modules\disk\pcem-hdd_file.h">
-      <Filter>Header Files\modules\disk</Filter>
-    </ClInclude>
-    <ClInclude Include="modules\disk\pcem-ide.h">
-      <Filter>Header Files\modules\disk</Filter>
     </ClInclude>
     <ClInclude Include="cpu\fpu.h">
       <Filter>Header Files\cpu</Filter>

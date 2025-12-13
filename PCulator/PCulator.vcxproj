@@ -198,8 +198,6 @@
     <ClCompile Include="modules\disk\ata.c" />
     <ClCompile Include="modules\disk\biosdisk.c" />
     <ClCompile Include="modules\disk\fdc.c" />
-    <ClCompile Include="modules\disk\pcem-ide.c" />
-    <ClCompile Include="modules\disk\pcem-hdd_file.c" />
     <ClCompile Include="modules\input\mouse.c" />
     <ClCompile Include="modules\io\ne2000.c" />
     <ClCompile Include="modules\io\pcap-win32.c" />
@@ -241,8 +239,6 @@
     <ClInclude Include="modules\disk\ata.h" />
     <ClInclude Include="modules\disk\biosdisk.h" />
     <ClInclude Include="modules\disk\fdc.h" />
-    <ClInclude Include="modules\disk\pcem-hdd_file.h" />
-    <ClInclude Include="modules\disk\pcem-ide.h" />
     <ClInclude Include="modules\input\input.h" />
     <ClInclude Include="modules\input\mouse.h" />
     <ClInclude Include="modules\input\sdlkeys.h" />

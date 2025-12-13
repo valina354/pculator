@@ -43,8 +43,6 @@
 #include "modules/video/cga.h"
 #include "modules/video/vga.h"
 #include "modules/disk/ata.h"
-#include "modules/disk/pcem-hdd_file.h"
-#include "modules/disk/pcem-ide.h"
 #include "debuglog.h"
 
 double speedarg = 0;

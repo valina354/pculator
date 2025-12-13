@@ -18,9 +18,9 @@ The code is a mess, and I wanted to clean it up/fix it a lot more before putting
 
 This is an extension of my other project XTulator, which is a much simpler and less-ambitious 8086 PC emulator. PCulator currently seems to have the 486 CPU core working fairly well, but there are still some issues with some of the bits surrounding the CPU.
 
-The only 32-bit OS I've currently had luck fully booting into and using is Debian 2.2 "Potato". It also boots MS-DOS and does well with most of the DOS4GW games I've tried. I haven't been able to boot any 32-bit Windows OS, not even Windows 3.1 in 386 enhanced mode.
+The only 32-bit OSes I've currently had luck fully booting into are some older Linux distros like Debian 2.2 and 3.1. It also boots MS-DOS and does well with most of the DOS4GW games I've tried. I haven't been able to boot any 32-bit Windows OS, not even Windows 3.1 in 386 enhanced mode.
 
-I haven't implemented a floppy controller or CD-ROM drives yet, so you can't install an OS from within PCulator at this point. I've been doing installations to hard disk images with QEMU or 86Box, and then booting the image in PCulator. My ATA controller is incomplete and apparently slightly broken, as Linux will occasionally hang for a few moments and then spit out "hda: lost interrupt" before continuing when accessing the disk. It's rare, but annoying.
+I haven't implemented a floppy controller or CD-ROM drives yet, so you can't install an OS from within PCulator at this point. I've been doing installations to hard disk images with QEMU or 86Box, and then booting the image in PCulator.
 
 Also, keep in mind that this works like a *real* 486 PC, meaning it runs a real 1990's era 486 BIOS when it starts, so you'll have to make sure you go into the BIOS setup and configure your disk image's geometry before booting it! Just like back in the day. You can use the BIOS's IDE auto-configure option as well. You'll need to do this any time you are using a different size disk image than you did last time.
 
@@ -65,3 +65,4 @@ If you really want to compile on Linux/Mac, you should be able to get it working
 ![Debian 2.2 Potato](screenshots/07.png)
 
 ![cat /proc/cpuinfo](screenshots/08.png)
+

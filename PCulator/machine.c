@@ -43,7 +43,6 @@
 #include "modules/disk/biosdisk.h"
 #include "modules/disk/fdc.h"
 #include "modules/disk/ata.h"
-#include "modules/disk/pcem-ide.h"
 #include "modules/input/mouse.h"
 #include "modules/input/input.h"
 #ifdef USE_NE2000

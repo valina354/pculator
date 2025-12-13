@@ -151,7 +151,12 @@ void i8259_doirq(I8259_t* i8259, uint8_t irqnum) {
 #ifdef DEBUG_PIC
 	debug_log(DEBUG_DETAIL, "[I8259] IRQ %u raised\r\n", irqnum);
 #endif
-	i8259->irr |= (1 << irqnum) & (~i8259->imr);
+	if ((i8259->master != NULL) && (irqnum == 6)) { //HACK: Why do I have to do this to make ATA reliable?
+		i8259->irr |= (1 << irqnum);
+	}
+	else {
+		i8259->irr |= (1 << irqnum) & (~i8259->imr);
+	}
 	if (i8259->master != NULL) { //if this is a slave PIC
 		//(*(I8259_t*)i8259->master).irr |= (1 << 2) & ((*(I8259_t*)i8259->master).imr); //then we need to fire IRQ 2 on the master also
 	}
