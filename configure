@@ -1,0 +1,784 @@
+#!/bin/sh
+
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+template="$script_dir/Makefile.in"
+output="$script_dir/Makefile"
+
+use_nuked_opl=yes
+use_pcap=auto
+use_nuklear=auto
+nfd_backend=auto
+frontend_backends=sdl
+default_frontend=
+
+host_os=$(uname -s 2>/dev/null || echo unknown)
+case "$host_os" in
+	MINGW*|MSYS*|CYGWIN*)
+		host_is_windows=yes
+		host_is_linux=no
+		host_is_macos=no
+		host_tag=windows
+		;;
+	Linux)
+		host_is_windows=no
+		host_is_linux=yes
+		host_is_macos=no
+		host_tag=linux
+		;;
+	Darwin)
+		host_is_windows=no
+		host_is_linux=no
+		host_is_macos=yes
+		host_tag=macos
+		;;
+	*)
+		host_is_windows=no
+		host_is_linux=no
+		host_is_macos=no
+		host_tag=unknown
+		;;
+esac
+
+cc=${CC:-cc}
+cxx=${CXX:-c++}
+objc=${OBJC:-cc}
+
+have_command() {
+	command -v "$1" >/dev/null 2>&1
+}
+
+check_c_link() {
+	source_text=$1
+	shift
+
+	if ! have_command "$cc"; then
+		return 1
+	fi
+
+	tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pculator-config.XXXXXX" 2>/dev/null || echo "")
+	if [ -z "$tmpdir" ]; then
+		return 1
+	fi
+
+	src="$tmpdir/test.c"
+	out="$tmpdir/test"
+	printf '%s\n' "$source_text" > "$src"
+
+	if "$cc" -o "$out" "$src" "$@" >/dev/null 2>&1; then
+		rm -rf "$tmpdir"
+		return 0
+	fi
+
+	rm -rf "$tmpdir"
+	return 1
+}
+
+check_cxx_link() {
+	source_text=$1
+	shift
+
+	if ! have_command "$cxx"; then
+		return 1
+	fi
+
+	tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pculator-config.XXXXXX" 2>/dev/null || echo "")
+	if [ -z "$tmpdir" ]; then
+		return 1
+	fi
+
+	src="$tmpdir/test.cpp"
+	out="$tmpdir/test"
+	printf '%s\n' "$source_text" > "$src"
+
+	if "$cxx" -o "$out" "$src" "$@" >/dev/null 2>&1; then
+		rm -rf "$tmpdir"
+		return 0
+	fi
+
+	rm -rf "$tmpdir"
+	return 1
+}
+
+check_objc_link() {
+	source_text=$1
+	shift
+
+	if ! have_command "$objc"; then
+		return 1
+	fi
+
+	tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/pculator-config.XXXXXX" 2>/dev/null || echo "")
+	if [ -z "$tmpdir" ]; then
+		return 1
+	fi
+
+	src="$tmpdir/test.m"
+	out="$tmpdir/test"
+	printf '%s\n' "$source_text" > "$src"
+
+	if "$objc" -o "$out" "$src" "$@" >/dev/null 2>&1; then
+		rm -rf "$tmpdir"
+		return 0
+	fi
+
+	rm -rf "$tmpdir"
+	return 1
+}
+
+pkg_config_exists() {
+	if ! have_command pkg-config; then
+		return 1
+	fi
+	pkg-config --exists "$1"
+}
+
+append_flag() {
+	value=$1
+	flag=$2
+
+	if [ -z "$flag" ]; then
+		printf '%s' "$value"
+	elif [ -z "$value" ]; then
+		printf '%s' "$flag"
+	else
+		printf '%s %s' "$value" "$flag"
+	fi
+}
+
+normalize_frontend_name() {
+	printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]'
+}
+
+is_valid_frontend() {
+	case "$1" in
+		sdl|vnc|null)
+			return 0
+			;;
+		*)
+			return 1
+			;;
+	esac
+}
+
+append_unique_word() {
+	list=$1
+	word=$2
+
+	for item in $list; do
+		if [ "$item" = "$word" ]; then
+			printf '%s' "$list"
+			return 0
+		fi
+	done
+
+	if [ -z "$list" ]; then
+		printf '%s' "$word"
+	else
+		printf '%s %s' "$list" "$word"
+	fi
+}
+
+normalize_frontend_list() {
+	input=$1
+	output=
+	old_ifs=$IFS
+
+	case "$input" in
+		''|,*|*,|*,,*)
+			return 1
+			;;
+	esac
+
+	IFS=','
+	set -- $input
+	IFS=$old_ifs
+
+	if [ $# -eq 0 ]; then
+		return 1
+	fi
+
+	for frontend in "$@"; do
+		frontend=$(normalize_frontend_name "$frontend")
+		if [ -z "$frontend" ] || ! is_valid_frontend "$frontend"; then
+			return 1
+		fi
+		output=$(append_unique_word "$output" "$frontend")
+	done
+
+	if [ -z "$output" ]; then
+		return 1
+	fi
+
+	printf '%s' "$output"
+}
+
+frontend_list_contains() {
+	list=$1
+	word=$2
+
+	for item in $list; do
+		if [ "$item" = "$word" ]; then
+			return 0
+		fi
+	done
+
+	return 1
+}
+
+sed_escape() {
+	printf '%s' "$1" | sed -e 's/[|&\\]/\\&/g'
+}
+
+detect_libpcap() {
+	if [ "$host_is_windows" = yes ]; then
+		return 0
+	fi
+
+	if pkg_config_exists libpcap; then
+		pcap_cflags=$(pkg-config --cflags libpcap 2>/dev/null || echo "")
+		pcap_libs=$(pkg-config --libs libpcap 2>/dev/null || echo "")
+		if check_c_link '#include <pcap.h>
+int main(void) { return 0; }' $pcap_cflags $pcap_libs; then
+			return 0
+		fi
+	fi
+
+	check_c_link '#include <pcap.h>
+int main(void) { return 0; }' -lpcap
+}
+
+detect_sdl2() {
+	if pkg_config_exists sdl2; then
+		sdl_cflags=$(pkg-config --cflags sdl2 2>/dev/null || echo "")
+		sdl_libs=$(pkg-config --libs sdl2 2>/dev/null || echo "")
+	elif have_command sdl2-config; then
+		sdl_cflags=$(sdl2-config --cflags 2>/dev/null || echo "")
+		sdl_libs=$(sdl2-config --libs 2>/dev/null || echo "")
+	else
+		return 1
+	fi
+
+	check_c_link '#include <SDL.h>
+int main(int argc, char** argv) { (void)argc; (void)argv; return 0; }' $sdl_cflags $sdl_libs
+}
+
+detect_libvncserver() {
+	vnc_cflags=
+	vnc_libs=
+
+	if pkg_config_exists libvncserver; then
+		vnc_cflags=$(pkg-config --cflags libvncserver 2>/dev/null || echo "")
+		vnc_libs=$(pkg-config --libs libvncserver 2>/dev/null || echo "")
+		if check_c_link '#include <rfb/rfb.h>
+int main(void) { return 0; }' $vnc_cflags $vnc_libs; then
+			return 0
+		fi
+	fi
+
+	vnc_cflags=
+	vnc_libs=-lvncserver
+	check_c_link '#include <rfb/rfb.h>
+int main(void) { return 0; }' $vnc_libs
+}
+
+have_nuklear_sources() {
+	[ -f "$script_dir/third_party/Nuklear/nuklear.h" ] &&
+	[ -f "$script_dir/third_party/Nuklear/demo/sdl_renderer/nuklear_sdl_renderer.h" ]
+}
+
+have_nfd_sources() {
+	[ -f "$script_dir/third_party/nativefiledialog-extended/src/include/nfd.h" ]
+}
+
+detect_linux_nfd_wayland() {
+	nfd_wayland_enabled=no
+	nfd_wayland_cppflags=
+	nfd_wayland_cflags=
+	nfd_wayland_libs=
+	nfd_wayland_scanner=
+	nfd_wayland_protocol=
+
+	if ! pkg_config_exists wayland-client; then
+		return 1
+	fi
+	if ! have_command wayland-scanner; then
+		return 1
+	fi
+
+	nfd_wayland_protocol=third_party/nativefiledialog-extended/3ps/wayland-protocols/unstable/xdg-foreign/xdg-foreign-unstable-v1.xml
+	if [ ! -f "$script_dir/$nfd_wayland_protocol" ]; then
+		return 1
+	fi
+
+	wayland_cflags=$(pkg-config --cflags wayland-client 2>/dev/null || echo "")
+	wayland_libs=$(pkg-config --libs wayland-client 2>/dev/null || echo "")
+	if ! check_cxx_link '#include <wayland-client.h>
+int main(void) { return 0; }' $wayland_cflags $wayland_libs; then
+		return 1
+	fi
+
+	nfd_wayland_enabled=yes
+	nfd_wayland_cppflags=-DNFD_WAYLAND
+	nfd_wayland_cflags=$wayland_cflags
+	nfd_wayland_libs=$wayland_libs
+	nfd_wayland_scanner=wayland-scanner
+	return 0
+}
+
+detect_linux_nfd_backend() {
+	nfd_cppflags=
+	nfd_cflags=
+	nfd_libs=
+	nfd_cxxsrc=
+	nfd_wayland_enabled=no
+	nfd_wayland_scanner=
+	nfd_wayland_protocol=
+
+	if ! have_command "$cxx"; then
+		return 1
+	fi
+
+	case "$nfd_backend" in
+		auto)
+			backend_candidates="gtk portal"
+			;;
+		gtk|portal)
+			backend_candidates="$nfd_backend"
+			;;
+		none)
+			return 1
+			;;
+		*)
+			echo "Unknown NFD backend: $nfd_backend" >&2
+			exit 1
+			;;
+	esac
+
+	for candidate in $backend_candidates; do
+		case "$candidate" in
+			gtk)
+				if pkg_config_exists gtk+-3.0; then
+					gtk_cflags=$(pkg-config --cflags gtk+-3.0 2>/dev/null || echo "")
+					gtk_libs=$(pkg-config --libs gtk+-3.0 2>/dev/null || echo "")
+					if check_cxx_link '#include <gtk/gtk.h>
+int main(void) { return 0; }' $gtk_cflags $gtk_libs; then
+						nfd_backend=gtk
+						nfd_cppflags="-DNFD_X11"
+						nfd_cflags=$gtk_cflags
+						nfd_libs=$gtk_libs
+						nfd_cxxsrc=third_party/nativefiledialog-extended/src/nfd_gtk.cpp
+						if detect_linux_nfd_wayland; then
+							nfd_cppflags=$(append_flag "$nfd_cppflags" "$nfd_wayland_cppflags")
+							nfd_cflags=$(append_flag "$nfd_cflags" "$nfd_wayland_cflags")
+							nfd_libs=$(append_flag "$nfd_libs" "$nfd_wayland_libs")
+						fi
+						return 0
+					fi
+				fi
+				;;
+			portal)
+				if pkg_config_exists dbus-1; then
+					dbus_cflags=$(pkg-config --cflags dbus-1 2>/dev/null || echo "")
+					dbus_libs=$(pkg-config --libs dbus-1 2>/dev/null || echo "")
+					if check_cxx_link '#include <dbus/dbus.h>
+int main(void) { return 0; }' $dbus_cflags $dbus_libs; then
+						nfd_backend=portal
+						nfd_cppflags="-DNFD_PORTAL -DNFD_X11"
+						nfd_cflags=$dbus_cflags
+						nfd_libs=$dbus_libs
+						nfd_cxxsrc=third_party/nativefiledialog-extended/src/nfd_portal.cpp
+						if detect_linux_nfd_wayland; then
+							nfd_cppflags=$(append_flag "$nfd_cppflags" "$nfd_wayland_cppflags")
+							nfd_cflags=$(append_flag "$nfd_cflags" "$nfd_wayland_cflags")
+							nfd_libs=$(append_flag "$nfd_libs" "$nfd_wayland_libs")
+						fi
+						return 0
+					fi
+				fi
+				;;
+		esac
+	done
+
+	return 1
+}
+
+detect_macos_nfd_backend() {
+	nfd_cppflags=
+	nfd_cflags=
+	nfd_libs=
+	nfd_objcsrc=
+
+	case "$nfd_backend" in
+		auto|cocoa)
+			if check_objc_link '#import <AppKit/AppKit.h>
+int main(void) { return 0; }' -framework AppKit -framework Foundation; then
+				nfd_backend=cocoa
+				nfd_libs="-framework AppKit -framework Foundation"
+				nfd_objcsrc=third_party/nativefiledialog-extended/src/nfd_cocoa.m
+				return 0
+			fi
+			;;
+		none)
+			return 1
+			;;
+		*)
+			echo "NFD backend '$nfd_backend' is not supported on macOS." >&2
+			exit 1
+			;;
+	esac
+
+	return 1
+}
+
+show_help() {
+	cat <<'EOF'
+Usage: ./configure [options]
+
+Feature options:
+  --enable-nuked-opl      Enable Nuked OPL emulation
+  --disable-nuked-opl     Disable Nuked OPL emulation
+  --enable-pcap           Enable host pcap support
+  --disable-pcap          Disable host pcap support
+  --enable-nuklear        Enable Nuklear control-panel UI
+  --disable-nuklear       Disable Nuklear control-panel UI
+  --with-nfd-backend=gtk|portal|auto
+                          Select the Native File Dialog backend on Linux
+  --with-frontends=sdl[,vnc][,null]
+                          Select the compiled frontend set
+  --with-default-frontend=sdl|vnc|null
+                          Select the default compiled frontend
+  --with-frontend=sdl|null|vnc
+                          Compatibility alias for a single compiled frontend
+  --help                  Show this help
+EOF
+}
+
+for opt in "$@"; do
+	case "$opt" in
+		--enable-nuked-opl) use_nuked_opl=yes ;;
+		--disable-nuked-opl) use_nuked_opl=no ;;
+		--enable-pcap) use_pcap=yes ;;
+		--disable-pcap) use_pcap=no ;;
+		--enable-nuklear) use_nuklear=yes ;;
+		--disable-nuklear) use_nuklear=no ;;
+		--with-nfd-backend=*)
+			nfd_backend=${opt#*=}
+			;;
+		--with-frontends=*)
+			frontend_backends=${opt#*=}
+			;;
+		--with-default-frontend=*)
+			default_frontend=${opt#*=}
+			;;
+		--with-frontend=*)
+			frontend_backends=${opt#*=}
+			default_frontend=${opt#*=}
+			;;
+		--help|-h)
+			show_help
+			exit 0
+			;;
+		*)
+			echo "Unknown option: $opt" >&2
+			show_help >&2
+			exit 1
+			;;
+	esac
+done
+
+if [ ! -f "$template" ]; then
+	echo "Missing Makefile template: $template" >&2
+	exit 1
+fi
+
+frontend_backends=$(normalize_frontend_list "$frontend_backends") || {
+	echo "Invalid frontend set: $frontend_backends" >&2
+	exit 1
+}
+
+if [ -n "$default_frontend" ]; then
+	default_frontend=$(normalize_frontend_name "$default_frontend")
+	if ! is_valid_frontend "$default_frontend"; then
+		echo "Invalid default frontend: $default_frontend" >&2
+		exit 1
+	fi
+else
+	set -- $frontend_backends
+	default_frontend=$1
+fi
+
+if ! frontend_list_contains "$frontend_backends" "$default_frontend"; then
+	echo "Default frontend '$default_frontend' is not included in the compiled set '$frontend_backends'." >&2
+	exit 1
+fi
+
+frontend_backends_display=$(printf '%s' "$frontend_backends" | tr ' ' ',')
+
+default_cflags='-O2'
+default_cxxflags='-O2'
+default_objcflags='-O2'
+default_ldflags=''
+nfd_wayland_enabled=no
+nfd_wayland_scanner=
+nfd_wayland_protocol=
+nfd_generated_dir=
+nfd_generated_hdr=
+nfd_generated_src=
+extra_csrcs=
+frontend_csrcs=
+host_csrcs=
+frontend_defines=
+frontend_has_sdl=no
+frontend_has_vnc=no
+frontend_has_null=no
+
+make_cppflags=${CPPFLAGS:-}
+make_cflags=${CFLAGS:-$default_cflags}
+make_cxxflags=${CXXFLAGS:-$default_cxxflags}
+make_objcflags=${OBJCFLAGS:-$default_objcflags}
+make_ldflags=${LDFLAGS:-$default_ldflags}
+make_ldlibs=
+
+make_cflags=$(append_flag "$make_cflags" "-std=c99")
+
+if [ "$host_is_windows" = yes ]; then
+	host_csrcs='src/host/host_win.c'
+else
+	host_csrcs='src/host/host_posix.c'
+fi
+
+if [ "$host_is_windows" != yes ]; then
+	make_cppflags=$(append_flag "$make_cppflags" "-D_FILE_OFFSET_BITS=64")
+	make_cflags=$(append_flag "$make_cflags" "-pthread")
+	make_cxxflags=$(append_flag "$make_cxxflags" "-pthread")
+	make_objcflags=$(append_flag "$make_objcflags" "-pthread")
+	make_ldflags=$(append_flag "$make_ldflags" "-pthread")
+	make_ldlibs=$(append_flag "$make_ldlibs" "-lm")
+fi
+
+if [ "$host_tag" = linux ]; then
+	make_cppflags=$(append_flag "$make_cppflags" "-D_DEFAULT_SOURCE")
+fi
+
+for frontend_backend in $frontend_backends; do
+	case "$frontend_backend" in
+		sdl)
+			frontend_has_sdl=yes
+			frontend_csrcs=$(append_flag "$frontend_csrcs" 'src/frontends/sdl/frontend_sdl.c src/frontends/sdl/hostkey_sdl.c src/frontends/sdl/frontend_sdl_ui.c')
+			frontend_defines=$(append_flag "$frontend_defines" "-DFRONTEND_HAS_SDL")
+			if ! detect_sdl2; then
+				echo "SDL2 headers and libraries are required for the SDL frontend." >&2
+				exit 1
+			fi
+			make_cppflags=$(append_flag "$make_cppflags" "$sdl_cflags")
+			make_ldlibs=$(append_flag "$make_ldlibs" "$sdl_libs")
+			;;
+		vnc)
+			frontend_has_vnc=yes
+			frontend_csrcs=$(append_flag "$frontend_csrcs" 'src/frontends/vnc/frontend_vnc.c src/frontends/vnc/hostkey_vnc.c')
+			frontend_defines=$(append_flag "$frontend_defines" "-DFRONTEND_HAS_VNC")
+			if ! detect_libvncserver; then
+				echo "libvncserver headers and libraries are required for the VNC frontend." >&2
+				exit 1
+			fi
+			make_cppflags=$(append_flag "$make_cppflags" "$vnc_cflags")
+			make_ldlibs=$(append_flag "$make_ldlibs" "$vnc_libs")
+			;;
+		null)
+			frontend_has_null=yes
+			frontend_csrcs=$(append_flag "$frontend_csrcs" 'src/frontends/null/frontend_null.c')
+			frontend_defines=$(append_flag "$frontend_defines" "-DFRONTEND_HAS_NULL")
+			;;
+		*)
+			echo "Unknown frontend backend: $frontend_backend" >&2
+			exit 1
+			;;
+	esac
+done
+
+case "$default_frontend" in
+	sdl)
+		frontend_defines=$(append_flag "$frontend_defines" "-DFRONTEND_DEFAULT_SDL")
+		;;
+	vnc)
+		frontend_defines=$(append_flag "$frontend_defines" "-DFRONTEND_DEFAULT_VNC")
+		;;
+	null)
+		frontend_defines=$(append_flag "$frontend_defines" "-DFRONTEND_DEFAULT_NULL")
+		;;
+	*)
+		echo "Unknown default frontend: $default_frontend" >&2
+		exit 1
+		;;
+esac
+
+if [ "$use_pcap" = auto ]; then
+	if detect_libpcap; then
+		use_pcap=yes
+	else
+		use_pcap=no
+	fi
+fi
+
+if [ "$use_nuklear" = auto ]; then
+	use_nuklear=no
+	if [ "$frontend_has_sdl" = yes ] && have_nuklear_sources && have_nfd_sources; then
+		if [ "$host_is_windows" = yes ]; then
+			use_nuklear=yes
+			nfd_backend=win
+		elif [ "$host_is_linux" = yes ] && detect_linux_nfd_backend; then
+			use_nuklear=yes
+		elif [ "$host_is_macos" = yes ] && detect_macos_nfd_backend; then
+			use_nuklear=yes
+		fi
+	fi
+fi
+
+if [ "$frontend_has_sdl" != yes ] && [ "$use_nuklear" = yes ]; then
+	echo "The SDL frontend must be compiled in to use the Nuklear control panel." >&2
+	exit 1
+fi
+
+if [ "$use_pcap" = yes ] && ! detect_libpcap; then
+	echo "Host networking support requires libpcap headers and libraries." >&2
+	exit 1
+fi
+
+if [ "$use_pcap" = yes ]; then
+	if [ "$host_is_windows" = yes ]; then
+		make_ldlibs=$(append_flag "$make_ldlibs" "-lwpcap")
+		make_ldlibs=$(append_flag "$make_ldlibs" "-lPacket")
+		make_ldlibs=$(append_flag "$make_ldlibs" "-lws2_32")
+	else
+		if pkg_config_exists libpcap; then
+			pcap_cflags=$(pkg-config --cflags libpcap 2>/dev/null || echo "")
+			pcap_libs=$(pkg-config --libs libpcap 2>/dev/null || echo "")
+		else
+			pcap_cflags=
+			pcap_libs=-lpcap
+		fi
+		make_cppflags=$(append_flag "$make_cppflags" "$pcap_cflags")
+		make_ldlibs=$(append_flag "$make_ldlibs" "$pcap_libs")
+	fi
+fi
+
+if [ "$use_nuklear" = yes ]; then
+	if ! have_nuklear_sources; then
+		echo "Nuklear sources were not found under third_party/Nuklear." >&2
+		exit 1
+	fi
+	if ! have_nfd_sources; then
+		echo "Native File Dialog sources were not found under third_party/nativefiledialog-extended." >&2
+		exit 1
+	fi
+
+	make_cppflags=$(append_flag "$make_cppflags" "-Ithird_party/nativefiledialog-extended/src/include")
+	case "$host_tag" in
+		windows)
+			nfd_backend=win
+			nfd_cxxsrc=src/frontends/sdl/frontend_sdl_nfd.cpp
+			make_ldlibs=$(append_flag "$make_ldlibs" "-lcomdlg32")
+			make_ldlibs=$(append_flag "$make_ldlibs" "-lole32")
+			make_ldlibs=$(append_flag "$make_ldlibs" "-luuid")
+			make_ldlibs=$(append_flag "$make_ldlibs" "-lshell32")
+			;;
+		linux)
+			if ! detect_linux_nfd_backend; then
+				echo "Nuklear UI on Linux requires an NFDe backend (GTK or portal)." >&2
+				exit 1
+			fi
+			if [ "$nfd_wayland_enabled" = yes ]; then
+				nfd_generated_dir='$(BUILD_DIR)/generated/nfd'
+				nfd_generated_hdr='$(NFD_GENERATED_DIR)/xdg-foreign-unstable-v1.h'
+				nfd_generated_src='$(NFD_GENERATED_DIR)/xdg-foreign-unstable-v1.c'
+				extra_csrcs='$(NFD_GENERATED_SRC)'
+				make_cppflags=$(append_flag "$make_cppflags" "-I\$(NFD_GENERATED_DIR)")
+			fi
+			make_cppflags=$(append_flag "$make_cppflags" "$nfd_cppflags")
+			make_cppflags=$(append_flag "$make_cppflags" "$nfd_cflags")
+			make_ldlibs=$(append_flag "$make_ldlibs" "$nfd_libs")
+			;;
+		macos)
+			if ! detect_macos_nfd_backend; then
+				echo "Nuklear UI on macOS requires the Cocoa NFDe backend." >&2
+				exit 1
+			fi
+			make_ldlibs=$(append_flag "$make_ldlibs" "$nfd_libs")
+			;;
+		*)
+			echo "Nuklear UI is not configured for host OS '$host_os'." >&2
+			exit 1
+			;;
+	esac
+else
+	nfd_backend=none
+	nfd_cxxsrc=
+	nfd_objcsrc=
+fi
+
+if [ -n "${nfd_cxxsrc:-}" ]; then
+	make_cxxflags=$(append_flag "$make_cxxflags" "-std=c++11")
+fi
+
+make_cppflags=$(append_flag "$make_cppflags" "-DCONFIGURED_BUILD=1")
+make_cppflags=$(append_flag "$make_cppflags" "$frontend_defines")
+if [ "$use_nuked_opl" = yes ]; then
+	make_cppflags=$(append_flag "$make_cppflags" "-DUSE_NUKED_OPL")
+fi
+if [ "$use_pcap" = yes ]; then
+	make_cppflags=$(append_flag "$make_cppflags" "-DUSE_PCAP")
+fi
+if [ "$use_nuklear" = yes ]; then
+	make_cppflags=$(append_flag "$make_cppflags" "-DUSE_NUKLEAR")
+fi
+
+program=PCulator
+if [ "$host_is_windows" = yes ]; then
+	program=PCulator.exe
+fi
+
+rm -f "$script_dir/src/config-features.h"
+
+sed \
+	-e "s|@CC@|$(sed_escape "$cc")|g" \
+	-e "s|@CXX@|$(sed_escape "$cxx")|g" \
+	-e "s|@OBJC@|$(sed_escape "$objc")|g" \
+	-e "s|@PROGRAM@|$(sed_escape "$program")|g" \
+	-e "s|@HOST_OS@|$(sed_escape "$host_tag")|g" \
+	-e "s|@USE_NUKED_OPL@|$(sed_escape "$use_nuked_opl")|g" \
+	-e "s|@USE_PCAP@|$(sed_escape "$use_pcap")|g" \
+	-e "s|@USE_NUKLEAR@|$(sed_escape "$use_nuklear")|g" \
+	-e "s|@NFD_BACKEND@|$(sed_escape "$nfd_backend")|g" \
+	-e "s|@NFD_WAYLAND@|$(sed_escape "$nfd_wayland_enabled")|g" \
+	-e "s|@FRONTEND_BACKENDS@|$(sed_escape "$frontend_backends_display")|g" \
+	-e "s|@DEFAULT_FRONTEND@|$(sed_escape "$default_frontend")|g" \
+	-e "s|@CPPFLAGS@|$(sed_escape "$make_cppflags")|g" \
+	-e "s|@CFLAGS@|$(sed_escape "$make_cflags")|g" \
+	-e "s|@CXXFLAGS@|$(sed_escape "$make_cxxflags")|g" \
+	-e "s|@OBJCFLAGS@|$(sed_escape "$make_objcflags")|g" \
+	-e "s|@LDFLAGS@|$(sed_escape "$make_ldflags")|g" \
+	-e "s|@LDLIBS@|$(sed_escape "$make_ldlibs")|g" \
+	-e "s|@NFD_GENERATED_DIR@|$(sed_escape "$nfd_generated_dir")|g" \
+	-e "s|@NFD_GENERATED_HDR@|$(sed_escape "$nfd_generated_hdr")|g" \
+	-e "s|@NFD_GENERATED_SRC@|$(sed_escape "$nfd_generated_src")|g" \
+	-e "s|@WAYLAND_SCANNER@|$(sed_escape "$nfd_wayland_scanner")|g" \
+	-e "s|@WAYLAND_PROTOCOL_XDG_FOREIGN@|$(sed_escape "$nfd_wayland_protocol")|g" \
+	-e "s|@FRONTEND_CSRCS@|$(sed_escape "$frontend_csrcs")|g" \
+	-e "s|@HOST_CSRCS@|$(sed_escape "$host_csrcs")|g" \
+	-e "s|@EXTRA_CSRCS@|$(sed_escape "$extra_csrcs")|g" \
+	-e "s|@CXXSRCS@|$(sed_escape "${nfd_cxxsrc:-}")|g" \
+	-e "s|@OBJCSRCS@|$(sed_escape "${nfd_objcsrc:-}")|g" \
+	"$template" > "$output"
+
+echo "Wrote $output"
+echo "Feature summary:"
+echo "  USE_NUKED_OPL : $use_nuked_opl"
+echo "  USE_PCAP      : $use_pcap"
+echo "  USE_NUKLEAR   : $use_nuklear"
+echo "  NFD backend   : $nfd_backend"
+echo "  NFD Wayland   : $nfd_wayland_enabled"
+echo "  Frontends     : $frontend_backends_display"
+echo "  Default       : $default_frontend"
+echo "  Output        : build/$program"
