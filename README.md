@@ -75,11 +75,11 @@ The VNC server is experimental and has not been tested much at all.
 
 ### Some screenshots
 
-![Award BIOS](screenshots/12.png)
+![Award BIOS](screenshots/13.png)
 
-![Windows 2000 Server](screenshots/10.png)
+![Windows 2000 Server](screenshots/11.png)
 
-![Debian Lenny running xfce4](screenshots/11.png)
+![Debian Lenny running xfce4](screenshots/12.png)
 
 ![Mortal Kombat 3 fighter select screen](screenshots/03.png)
 
