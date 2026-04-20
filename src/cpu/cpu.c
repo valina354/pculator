@@ -1120,11 +1120,8 @@ void cpu_intcall(CPU_t* cpu, uint8_t intnum, uint8_t source, uint32_t err) {
 	int has_err;
 	int include_vm86;
 	int frame_size;
-	int real_style_int;
 
-	real_style_int = !cpu->protected_mode;
-
-	if (real_style_int) { // real mode or VM86 software interrupt with IOPL >= 3
+	if (!cpu->protected_mode) { // real mode
 		uint32_t real_flags = makeflagsword(cpu);
 		uint16_t target_cs;
 		uint16_t target_ip;
